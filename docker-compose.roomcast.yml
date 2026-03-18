@@ -1,0 +1,20 @@
+services:
+  roomcast:
+    build:
+      context: .
+      dockerfile: Dockerfile.roomcast
+    container_name: roomcast
+    restart: unless-stopped
+    ports:
+      - "1967:1967"
+    environment:
+      ROOMCAST_DB_PATH: ${ROOMCAST_DB_PATH:-/app/data/roomcast.db}
+      ROOMCAST_SECRET_KEY: ${ROOMCAST_SECRET_KEY:-change-me}
+      ROOMCAST_DEFAULT_PIN: ${ROOMCAST_DEFAULT_PIN:-7070}
+      ROOMCAST_PUBLIC_NAME: ${ROOMCAST_PUBLIC_NAME:-NTC Newark WebCall}
+      ROOMCAST_LISTENER_NAME: ${ROOMCAST_LISTENER_NAME:-Main Stream Hall}
+      ROOMCAST_ADMIN_PASSWORD: ${ROOMCAST_ADMIN_PASSWORD:-change-me}
+      ROOMCAST_TELEPHONY_SECRET: ${ROOMCAST_TELEPHONY_SECRET:-change-me}
+      ROOMCAST_TWILIO_WEBHOOK_TOKEN: ${ROOMCAST_TWILIO_WEBHOOK_TOKEN:-change-me}
+    volumes:
+      - ./data:/app/data
