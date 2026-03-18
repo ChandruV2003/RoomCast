@@ -2541,7 +2541,7 @@ ADMIN_PANEL_TEMPLATE = """
           var(--bg);
       }
       main {
-        max-width: 1120px;
+        max-width: 1040px;
         margin: 0 auto;
         padding: 1rem 1rem 2.5rem;
       }
@@ -2558,8 +2558,8 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .brand h1 {
         margin: 0;
-        font-size: clamp(2rem, 5vw, 3.2rem);
-        line-height: 0.95;
+        font-size: clamp(1.8rem, 4vw, 2.7rem);
+        line-height: 1;
       }
       .brand p {
         margin: 0;
@@ -2569,7 +2569,7 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .top-actions {
         display: flex;
-        gap: 0.55rem;
+        gap: 0.5rem;
         flex-wrap: wrap;
       }
       .eyebrow {
@@ -2595,10 +2595,11 @@ ADMIN_PANEL_TEMPLATE = """
       .danger-button,
       .close-button {
         appearance: none;
-        border-radius: 12px;
+        border-radius: 10px;
         font-weight: 700;
         cursor: pointer;
         text-decoration: none;
+        white-space: nowrap;
         transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, color 140ms ease;
       }
       .utility-button:hover,
@@ -2624,25 +2625,20 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .utility-button,
       .close-button {
-        padding: 0.78rem 0.95rem;
+        padding: 0.64rem 0.88rem;
       }
       .primary-button,
       .ghost-button,
       .danger-button {
-        min-height: 3.15rem;
-        padding: 0.82rem 1rem;
+        min-height: 2.7rem;
+        padding: 0.68rem 0.92rem;
       }
       .primary-button {
-        min-width: 13rem;
         border: none;
         background: #dff4ff;
         color: #081018;
       }
-      .ghost-button {
-        min-width: 11rem;
-      }
       .danger-button {
-        min-width: 11rem;
         border: 1px solid rgba(255, 155, 155, 0.28);
         background: var(--bad-soft);
         color: #ffdede;
@@ -2658,7 +2654,7 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .command-shell {
         display: grid;
-        grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.9fr);
+        grid-template-columns: minmax(0, 1.35fr) minmax(310px, 0.85fr);
         gap: 1rem;
         padding: 1rem;
       }
@@ -2674,22 +2670,28 @@ ADMIN_PANEL_TEMPLATE = """
       .command-card,
       .state-card {
         display: grid;
+        gap: 0.9rem;
+      }
+      .command-rail {
+        display: flex;
+        justify-content: space-between;
         gap: 1rem;
+        align-items: start;
       }
       .command-copy {
         display: grid;
-        gap: 0.6rem;
+        gap: 0.45rem;
       }
       .command-copy h2 {
         margin: 0;
-        font-size: clamp(2rem, 6vw, 3.3rem);
-        line-height: 0.95;
+        font-size: clamp(1.6rem, 4vw, 2.2rem);
+        line-height: 1;
         font-weight: 700;
       }
       .command-copy p {
         margin: 0;
         color: var(--muted);
-        font-size: 1rem;
+        font-size: 0.94rem;
         line-height: 1.45;
       }
       .state-pill {
@@ -2725,19 +2727,25 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .command-actions {
         display: flex;
-        gap: 0.75rem;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 0.5rem;
         flex-wrap: wrap;
+        flex-shrink: 0;
+      }
+      .command-actions form {
+        margin: 0;
       }
       .stat-strip {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 0.75rem;
+        gap: 0.6rem;
       }
       .stat {
-        border-radius: 12px;
+        border-radius: 10px;
         border: 1px solid var(--line);
         background: var(--surface-2);
-        padding: 0.85rem;
+        padding: 0.72rem 0.8rem;
       }
       .stat span {
         display: block;
@@ -2750,8 +2758,8 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .stat strong {
         display: block;
-        margin-top: 0.42rem;
-        font-size: 1.02rem;
+        margin-top: 0.35rem;
+        font-size: 0.98rem;
         font-weight: 700;
       }
       .flash-stack {
@@ -2897,15 +2905,15 @@ ADMIN_PANEL_TEMPLATE = """
         gap: 1rem;
         align-items: center;
         margin-bottom: 1rem;
-        padding: 0.95rem 1rem;
-        border-radius: 12px;
+        padding: 0.85rem 0.95rem;
+        border-radius: 10px;
         border: 1px solid var(--line);
         background: var(--surface);
       }
       .listener-summary strong {
         display: block;
-        font-size: 2.15rem;
-        line-height: 0.95;
+        font-size: 1.9rem;
+        line-height: 1;
       }
       .listener-summary p {
         margin: 0.22rem 0 0;
@@ -3014,7 +3022,7 @@ ADMIN_PANEL_TEMPLATE = """
       }
       .room-choice strong {
         display: block;
-        font-size: 1.22rem;
+        font-size: 1.08rem;
       }
       .room-choice p {
         margin: 0.35rem 0 0;
@@ -3026,6 +3034,9 @@ ADMIN_PANEL_TEMPLATE = """
         .listeners-grid,
         .room-grid {
           grid-template-columns: 1fr;
+        }
+        .command-rail {
+          flex-direction: column;
         }
         .stat-strip {
           grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3091,27 +3102,29 @@ ADMIN_PANEL_TEMPLATE = """
 
       <section class="panel command-shell">
         <article class="command-card">
-          <div class="command-copy">
-            <span class="state-pill {{ call_state.tone }} {% if call_state.tone != 'idle' %}pulse{% endif %}">{{ call_state.label }}</span>
-            <h2>{{ call_state.headline }}</h2>
-            <p>{{ call_state.detail }}</p>
-          </div>
+          <div class="command-rail">
+            <div class="command-copy">
+              <span class="state-pill {{ call_state.tone }} {% if call_state.tone != 'idle' %}pulse{% endif %}">{{ call_state.label }}</span>
+              <h2>{{ call_state.headline }}</h2>
+              <p>{{ call_state.detail }}</p>
+            </div>
 
-          <div class="command-actions">
-            {% if active_meeting %}
-            <form method="post" action="{{ url_for('admin_stop_call') }}">
-              <input type="hidden" name="room_slug" value="{{ active_room_slug }}">
-              <button class="danger-button" type="submit">Stop Call</button>
-            </form>
-            <button class="ghost-button" type="button" data-open-room-dialog>Change Room</button>
-            {% else %}
-            <button class="primary-button" type="button" data-open-room-dialog>Start Call</button>
-            {% endif %}
-            {% if resume_available %}
-            <form method="post" action="{{ url_for('admin_use_schedule') }}">
-              <button class="ghost-button" type="submit">Return to Auto</button>
-            </form>
-            {% endif %}
+            <div class="command-actions">
+              {% if active_meeting %}
+              <form method="post" action="{{ url_for('admin_stop_call') }}">
+                <input type="hidden" name="room_slug" value="{{ active_room_slug }}">
+                <button class="danger-button" type="submit">Stop Call</button>
+              </form>
+              <button class="ghost-button" type="button" data-open-room-dialog>Change Room</button>
+              {% else %}
+              <button class="primary-button" type="button" data-open-room-dialog>Start Call</button>
+              {% endif %}
+              {% if resume_available %}
+              <form method="post" action="{{ url_for('admin_use_schedule') }}">
+                <button class="ghost-button" type="submit">Return to Auto</button>
+              </form>
+              {% endif %}
+            </div>
           </div>
 
           {% if control_host %}
