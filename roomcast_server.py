@@ -1291,14 +1291,21 @@ LANDING_TEMPLATE = """
     <style>
       :root {
         color-scheme: dark;
-        --bg: #081118;
-        --panel: rgba(10, 17, 26, 0.9);
+        --bg: #081018;
+        --surface: #0f1822;
+        --surface-2: #142030;
+        --surface-3: #1a2838;
         --text: #eef4fb;
-        --muted: #9eb1c8;
-        --line: rgba(146, 184, 228, 0.12);
-        --accent: #72d0ff;
-        --accent-2: #6ff0c2;
+        --muted: #99a8b8;
+        --line: #213244;
+        --line-strong: #31506d;
+        --accent: #87d6ff;
+        --good: #74ddb4;
+        --good-soft: rgba(116, 221, 180, 0.12);
         --warn: #ffb770;
+        --warn-soft: rgba(255, 183, 112, 0.12);
+        --shadow: 0 18px 44px rgba(0, 0, 0, 0.24);
+        --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
       }
       * { box-sizing: border-box; }
       body {
@@ -1306,151 +1313,159 @@ LANDING_TEMPLATE = """
         font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
         color: var(--text);
         background:
-          radial-gradient(circle at 18% 18%, rgba(114, 208, 255, 0.2), transparent 24rem),
-          radial-gradient(circle at 82% 78%, rgba(111, 240, 194, 0.16), transparent 24rem),
-          linear-gradient(145deg, rgba(17, 32, 49, 0.94), rgba(8, 17, 24, 1)),
+          radial-gradient(circle at top, rgba(135, 214, 255, 0.06), transparent 28rem),
+          linear-gradient(180deg, #0d151e, #081018 44rem),
           var(--bg);
         min-height: 100vh;
-        display: grid;
-        place-items: center;
-      }
-      body::before {
-        content: "";
-        position: fixed;
-        inset: 0;
-        pointer-events: none;
-        background:
-          linear-gradient(125deg, rgba(255, 255, 255, 0.05), transparent 28%),
-          linear-gradient(305deg, rgba(255, 255, 255, 0.04), transparent 34%);
       }
       main {
-        width: min(100%, 520px);
-        padding: 1.25rem;
-      }
-      .shell {
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 32px;
-        padding: 1.35rem;
-        box-shadow: 0 28px 90px rgba(0, 0, 0, 0.34);
-        backdrop-filter: blur(18px);
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 1rem 1rem 2.5rem;
       }
       .eyebrow {
         display: inline-flex;
+        width: fit-content;
         border-radius: 999px;
-        padding: 0.34rem 0.82rem;
-        background: rgba(114, 208, 255, 0.08);
+        padding: 0.22rem 0.58rem;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.02);
         color: var(--accent);
         text-transform: uppercase;
-        letter-spacing: 0.1em;
-        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        font-size: 0.72rem;
         font-weight: 700;
+        font-family: var(--mono);
       }
-      h1 {
-        margin: 0.9rem 0 0;
-        font-size: clamp(2.5rem, 10vw, 4.25rem);
-        line-height: 0.92;
-        letter-spacing: -0.04em;
+      .shell {
+        background: rgba(12, 20, 30, 0.96);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        box-shadow: var(--shadow);
+        padding: 1rem;
+      }
+      .brand {
+        display: grid;
+        gap: 0.3rem;
+        justify-items: center;
+        text-align: center;
+      }
+      .brand h1 {
+        margin: 0.15rem 0 0;
+        font-size: clamp(2.1rem, 8vw, 3.6rem);
+        line-height: 0.96;
+      }
+      .brand p {
+        margin: 0;
+        color: var(--muted);
+        max-width: 28rem;
+        line-height: 1.45;
       }
       .banner {
         margin-top: 1rem;
-        border-radius: 18px;
-        padding: 0.9rem 1rem;
-        background: rgba(114, 208, 255, 0.08);
-        color: var(--accent);
+        border-radius: 12px;
+        padding: 0.82rem 0.95rem;
         font-weight: 600;
+        border: 1px solid var(--line);
+        background: var(--good-soft);
+        color: var(--good);
       }
       .banner.error {
-        background: rgba(255, 183, 112, 0.1);
+        background: var(--warn-soft);
         color: var(--warn);
       }
       .status-panel {
         margin-top: 1rem;
-        border-radius: 22px;
+        border-radius: 14px;
         border: 1px solid var(--line);
-        background:
-          radial-gradient(circle at top right, rgba(112, 209, 255, 0.08), transparent 18rem),
-          linear-gradient(180deg, rgba(17, 30, 45, 0.96), rgba(9, 17, 26, 0.98));
+        background: var(--surface);
         padding: 1rem;
+        text-align: center;
       }
       .status-panel.good {
-        border-color: rgba(110, 240, 196, 0.2);
+        border-color: rgba(116, 221, 180, 0.28);
       }
       .status-kicker {
-        font-size: 0.84rem;
+        font-size: 0.76rem;
         letter-spacing: 0.08em;
         text-transform: uppercase;
         color: var(--muted);
         font-weight: 700;
+        font-family: var(--mono);
       }
       .status-headline {
         margin-top: 0.45rem;
-        font-size: clamp(1.4rem, 5vw, 2.4rem);
-        line-height: 1;
+        font-size: clamp(1.4rem, 5vw, 2rem);
+        line-height: 1.05;
         font-weight: 700;
       }
       .status-detail {
         margin-top: 0.55rem;
         color: var(--muted);
-        line-height: 1.5;
+        line-height: 1.45;
       }
       .entry {
         margin-top: 1.1rem;
-        border-radius: 28px;
+        border-radius: 14px;
         border: 1px solid var(--line);
-        background:
-          linear-gradient(180deg, rgba(17, 30, 45, 0.95), rgba(10, 18, 28, 0.98));
-        padding: 1.15rem;
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-      }
-      .entry h2 {
-        margin: 0;
-        font-size: 1.05rem;
+        background: var(--surface);
+        padding: 1rem;
       }
       form {
         display: grid;
         gap: 0.9rem;
-        margin-top: 0.95rem;
-      }
-      label {
-        display: grid;
-        gap: 0.5rem;
-        font-weight: 600;
-        font-size: 0.92rem;
-        color: var(--muted);
       }
       input, button, a {
         font: inherit;
       }
       input {
         width: 100%;
-        border: 1px solid rgba(146, 184, 228, 0.16);
-        border-radius: 22px;
-        background: rgba(6, 13, 20, 0.78);
-        padding: 1.1rem 1rem;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface-2);
+        padding: 1rem;
         color: var(--text);
-        font-size: 2rem;
-        letter-spacing: 0.42em;
+        font-size: clamp(1.5rem, 8vw, 2rem);
+        letter-spacing: 0.32em;
         text-align: center;
+        font-family: var(--mono);
       }
       button {
         appearance: none;
-        border: none;
-        border-radius: 999px;
-        padding: 0.95rem 1rem;
-        background: linear-gradient(135deg, #57c7ff, #67efc0);
-        color: #041018;
-        font-weight: 700;
+        border: 0;
+        border-radius: 12px;
+        padding: 0.84rem 1.4rem;
+        background: #dff4ff;
+        color: #081018;
+        font-weight: 800;
         cursor: pointer;
-        box-shadow: 0 14px 34px rgba(87, 199, 255, 0.22);
+        justify-self: center;
+        min-width: 12rem;
+      }
+      @media (max-width: 640px) {
+        main {
+          padding: 0.8rem 0.8rem 2rem;
+        }
+        .shell,
+        .status-panel,
+        .entry {
+          border-radius: 14px;
+        }
+        button {
+          width: 100%;
+          min-width: 0;
+        }
       }
     </style>
   </head>
   <body>
     <main>
       <section class="shell">
-        <span class="eyebrow">NTC Newark</span>
-        <h1>{{ listener_name }}</h1>
+        <div class="brand">
+          <span class="eyebrow">NTC Newark</span>
+          <h1>{{ listener_name }}</h1>
+          <p>{{ project_name }}</p>
+        </div>
         {% if message %}
         <div class="banner">{{ message }}</div>
         {% endif %}
@@ -1466,20 +1481,18 @@ LANDING_TEMPLATE = """
 
         <section class="entry">
           <form method="post" action="{{ url_for('join') }}">
-            <label>
-              <input
-                type="password"
-                name="join_pin"
-                inputmode="numeric"
-                pattern="[0-9]{4}"
-                minlength="4"
-                maxlength="4"
-                autocomplete="one-time-code"
-                placeholder="Enter PIN"
-                autofocus
-                required
-              >
-            </label>
+            <input
+              type="password"
+              name="join_pin"
+              inputmode="numeric"
+              pattern="[0-9]{4}"
+              minlength="4"
+              maxlength="4"
+              autocomplete="one-time-code"
+              placeholder="Enter PIN"
+              autofocus
+              required
+            >
             <button type="submit">Enter</button>
           </form>
         </section>
@@ -1500,14 +1513,19 @@ ROOM_TEMPLATE = """
     <style>
       :root {
         color-scheme: dark;
-        --bg: #071018;
-        --panel: rgba(11, 18, 28, 0.92);
+        --bg: #081018;
+        --surface: #0f1822;
+        --surface-2: #142030;
+        --surface-3: #1a2838;
         --text: #eef4fb;
-        --muted: #99adc5;
-        --line: rgba(146, 184, 228, 0.12);
-        --accent: #70d1ff;
-        --accent-2: #6ef0c4;
+        --muted: #99a8b8;
+        --line: #213244;
+        --line-strong: #31506d;
+        --accent: #87d6ff;
+        --good: #74ddb4;
         --warn: #ffb770;
+        --shadow: 0 18px 44px rgba(0, 0, 0, 0.24);
+        --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
       }
       * { box-sizing: border-box; }
       body {
@@ -1515,9 +1533,8 @@ ROOM_TEMPLATE = """
         font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
         color: var(--text);
         background:
-          radial-gradient(circle at top left, rgba(112, 209, 255, 0.18), transparent 24rem),
-          radial-gradient(circle at bottom right, rgba(110, 240, 196, 0.14), transparent 22rem),
-          linear-gradient(160deg, rgba(13, 23, 35, 1), rgba(7, 16, 24, 1)),
+          radial-gradient(circle at top, rgba(135, 214, 255, 0.06), transparent 28rem),
+          linear-gradient(180deg, #0d151e, #081018 44rem),
           var(--bg);
         min-height: 100vh;
       }
@@ -1527,58 +1544,71 @@ ROOM_TEMPLATE = """
         padding: 1rem 1rem 3rem;
       }
       .shell {
-        background: var(--panel);
+        background: rgba(12, 20, 30, 0.96);
         border: 1px solid var(--line);
-        border-radius: 28px;
-        padding: 1.2rem;
-        box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+        border-radius: 16px;
+        padding: 1rem;
+        box-shadow: var(--shadow);
       }
       .eyebrow {
         display: inline-flex;
+        width: fit-content;
         border-radius: 999px;
-        padding: 0.28rem 0.75rem;
-        background: rgba(112, 209, 255, 0.08);
+        padding: 0.22rem 0.58rem;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.02);
         color: var(--accent);
-        font-size: 0.78rem;
         text-transform: uppercase;
         letter-spacing: 0.08em;
+        font-size: 0.72rem;
         font-weight: 700;
+        font-family: var(--mono);
       }
-      h1 {
-        margin: 0.8rem 0 0;
-        font-size: clamp(2.4rem, 10vw, 4.5rem);
-        line-height: 0.95;
-        letter-spacing: -0.04em;
+      .brand {
+        display: grid;
+        gap: 0.3rem;
+        justify-items: center;
+        text-align: center;
+      }
+      .brand h1 {
+        margin: 0.15rem 0 0;
+        font-size: clamp(2.1rem, 8vw, 3.6rem);
+        line-height: 0.96;
+      }
+      .brand p {
+        margin: 0;
+        color: var(--muted);
       }
       .stack {
         display: grid;
-        gap: 0.85rem;
+        gap: 1rem;
         margin-top: 1rem;
       }
       .panel {
-        border-radius: 20px;
+        border-radius: 14px;
         border: 1px solid var(--line);
-        background: linear-gradient(180deg, rgba(15, 26, 39, 0.98), rgba(9, 17, 26, 0.98));
+        background: var(--surface);
         padding: 1rem;
       }
       .chips {
         display: flex;
         gap: 0.45rem;
         flex-wrap: wrap;
+        justify-content: center;
       }
       .chip {
         display: inline-flex;
         align-items: center;
         border-radius: 999px;
-        padding: 0.3rem 0.75rem;
-        background: rgba(112, 209, 255, 0.08);
+        padding: 0.28rem 0.72rem;
+        background: rgba(135, 214, 255, 0.08);
         color: var(--accent);
-        font-size: 0.88rem;
+        font-size: 0.84rem;
         font-weight: 600;
       }
       .chip.good {
-        background: rgba(110, 240, 196, 0.12);
-        color: var(--accent-2);
+        background: rgba(116, 221, 180, 0.12);
+        color: var(--good);
       }
       .chip.warn {
         background: rgba(255, 183, 112, 0.12);
@@ -1586,25 +1616,22 @@ ROOM_TEMPLATE = """
       }
       .player-shell {
         margin-top: 1rem;
-        border-radius: 22px;
+        border-radius: 14px;
         border: 1px solid var(--line);
-        background:
-          radial-gradient(circle at top right, rgba(112, 209, 255, 0.08), transparent 18rem),
-          linear-gradient(180deg, rgba(18, 31, 46, 0.95), rgba(7, 14, 21, 0.98));
+        background: var(--surface-2);
         padding: 1rem;
       }
       .listen-button {
         appearance: none;
-        border: none;
-        border-radius: 999px;
-        padding: 0.95rem 1.1rem;
-        background: linear-gradient(135deg, #57c7ff, #67efc0);
-        color: #041018;
+        border: 0;
+        border-radius: 12px;
+        padding: 0.84rem 1.2rem;
+        background: #dff4ff;
+        color: #081018;
         font: inherit;
-        font-weight: 700;
+        font-weight: 800;
         cursor: pointer;
         width: 100%;
-        box-shadow: 0 14px 34px rgba(87, 199, 255, 0.22);
       }
       .listen-button[hidden] {
         display: none;
@@ -1618,7 +1645,7 @@ ROOM_TEMPLATE = """
         align-items: center;
         gap: 1rem;
         color: var(--muted);
-        font-size: 0.92rem;
+        font-size: 0.9rem;
         font-weight: 600;
       }
       .meter-track {
@@ -1646,7 +1673,7 @@ ROOM_TEMPLATE = """
         gap: 1rem;
         color: var(--muted);
         font-weight: 600;
-        font-size: 0.92rem;
+        font-size: 0.9rem;
       }
       input[type="range"] {
         width: 100%;
@@ -1655,16 +1682,31 @@ ROOM_TEMPLATE = """
       .small {
         margin-top: 0.9rem;
         color: var(--muted);
-        font-size: 0.92rem;
+        font-size: 0.9rem;
+        line-height: 1.45;
+        text-align: center;
       }
       audio { display: none; }
+      @media (max-width: 640px) {
+        main {
+          padding: 0.8rem 0.8rem 2rem;
+        }
+        .shell,
+        .panel,
+        .player-shell {
+          border-radius: 14px;
+        }
+      }
     </style>
   </head>
   <body>
     <main>
       <section class="shell">
-        <div class="eyebrow">{{ project_name }}</div>
-        <h1>{{ listener_name }}</h1>
+        <div class="brand">
+          <div class="eyebrow">{{ project_name }}</div>
+          <h1>{{ listener_name }}</h1>
+          <p>Audio opens automatically when the meeting is live.</p>
+        </div>
 
         <section class="stack">
           <article class="panel">
@@ -3361,6 +3403,829 @@ ADMIN_PANEL_TEMPLATE = """
 """
 
 
+ADMIN_LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ project_name }} Admin</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #081018;
+        --surface: #0f1822;
+        --surface-2: #142030;
+        --text: #eef4fb;
+        --muted: #99a8b8;
+        --line: #213244;
+        --accent: #87d6ff;
+        --warn: #ffb770;
+        --shadow: 0 18px 44px rgba(0, 0, 0, 0.24);
+        --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top, rgba(135, 214, 255, 0.06), transparent 28rem),
+          linear-gradient(180deg, #0d151e, #081018 44rem),
+          var(--bg);
+        min-height: 100vh;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 1rem 1rem 2.5rem;
+      }
+      .shell {
+        background: rgba(12, 20, 30, 0.96);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 1rem;
+        box-shadow: var(--shadow);
+      }
+      .brand {
+        display: grid;
+        gap: 0.3rem;
+        justify-items: center;
+        text-align: center;
+      }
+      .eyebrow {
+        display: inline-flex;
+        width: fit-content;
+        border-radius: 999px;
+        padding: 0.22rem 0.58rem;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.02);
+        color: var(--accent);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 0.72rem;
+        font-weight: 700;
+        font-family: var(--mono);
+      }
+      .brand h1 {
+        margin: 0.15rem 0 0;
+        font-size: clamp(2rem, 8vw, 3.2rem);
+        line-height: 0.96;
+      }
+      .brand p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      .banner {
+        margin-top: 1rem;
+        border-radius: 12px;
+        padding: 0.82rem 0.95rem;
+        border: 1px solid var(--line);
+        background: rgba(255, 183, 112, 0.1);
+        color: var(--warn);
+        font-weight: 600;
+      }
+      form {
+        display: grid;
+        gap: 0.85rem;
+        margin-top: 1rem;
+      }
+      .field {
+        display: grid;
+        gap: 0.5rem;
+      }
+      .field label {
+        color: var(--muted);
+        font-size: 0.84rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+        font-family: var(--mono);
+      }
+      input, button {
+        font: inherit;
+      }
+      input {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface-2);
+        padding: 0.9rem 0.95rem;
+        color: var(--text);
+      }
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 12px;
+        padding: 0.84rem 1.4rem;
+        background: #dff4ff;
+        color: #081018;
+        font-weight: 800;
+        cursor: pointer;
+        justify-self: center;
+        min-width: 12rem;
+      }
+      @media (max-width: 640px) {
+        main {
+          padding: 0.8rem 0.8rem 2rem;
+        }
+        .shell {
+          border-radius: 14px;
+        }
+        button {
+          width: 100%;
+          min-width: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="shell">
+        <div class="brand">
+          <div class="eyebrow">Control Panel</div>
+          <h1>{{ project_name }}</h1>
+          <p>Sign in to start or stop the line.</p>
+        </div>
+        {% if error %}
+        <div class="banner">{{ error }}</div>
+        {% endif %}
+        <form method="post" action="{{ url_for('admin_login') }}">
+          <div class="field">
+            <label for="password">Password</label>
+            <input id="password" type="password" name="password" autocomplete="current-password" autofocus required>
+          </div>
+          <button type="submit">Open Panel</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
+ADMIN_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ project_name }} Control Panel</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #081018;
+        --surface: #0f1822;
+        --surface-2: #142030;
+        --surface-3: #1a2838;
+        --text: #eef4fb;
+        --muted: #99a8b8;
+        --line: #213244;
+        --line-strong: #31506d;
+        --accent: #87d6ff;
+        --good: #74ddb4;
+        --good-soft: rgba(116, 221, 180, 0.12);
+        --warn: #ffb770;
+        --warn-soft: rgba(255, 183, 112, 0.12);
+        --bad: #ff8c8c;
+        --bad-soft: rgba(255, 140, 140, 0.12);
+        --shadow: 0 18px 44px rgba(0, 0, 0, 0.24);
+        --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top, rgba(135, 214, 255, 0.06), transparent 28rem),
+          linear-gradient(180deg, #0d151e, #081018 44rem),
+          var(--bg);
+      }
+      main {
+        max-width: 1040px;
+        margin: 0 auto;
+        padding: 1rem 1rem 2.5rem;
+      }
+      .topbar {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 1rem;
+        align-items: center;
+        margin-bottom: 1rem;
+      }
+      .brand {
+        display: grid;
+        gap: 0.3rem;
+        justify-items: center;
+        text-align: center;
+      }
+      .brand h1 {
+        margin: 0.15rem 0 0;
+        font-size: clamp(2rem, 6vw, 3.2rem);
+        line-height: 0.96;
+      }
+      .brand p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .top-actions {
+        display: flex;
+        gap: 0.65rem;
+        justify-self: end;
+      }
+      .eyebrow,
+      .state-pill {
+        display: inline-flex;
+        width: fit-content;
+        border-radius: 999px;
+        padding: 0.22rem 0.58rem;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.02);
+        color: var(--accent);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 0.72rem;
+        font-weight: 700;
+        font-family: var(--mono);
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      .panel {
+        background: rgba(12, 20, 30, 0.96);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        box-shadow: var(--shadow);
+      }
+      .panel + .panel {
+        margin-top: 1rem;
+      }
+      .utility-button,
+      .primary-button,
+      .secondary-button,
+      .ghost-button,
+      .close-button,
+      .room-choice {
+        appearance: none;
+        font: inherit;
+        border-radius: 12px;
+        text-decoration: none;
+        transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, color 140ms ease;
+      }
+      .utility-button,
+      .ghost-button,
+      .secondary-button,
+      .close-button,
+      .room-choice {
+        border: 1px solid var(--line);
+        background: var(--surface-2);
+        color: var(--text);
+      }
+      .utility-button,
+      .ghost-button,
+      .secondary-button,
+      .close-button {
+        padding: 0.74rem 0.92rem;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .primary-button {
+        border: 0;
+        padding: 0.84rem 1.4rem;
+        background: #dff4ff;
+        color: #081018;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      .secondary-button {
+        color: var(--bad);
+      }
+      .utility-button:hover,
+      .utility-button:focus-visible,
+      .primary-button:hover,
+      .primary-button:focus-visible,
+      .ghost-button:hover,
+      .ghost-button:focus-visible,
+      .secondary-button:hover,
+      .secondary-button:focus-visible,
+      .close-button:hover,
+      .close-button:focus-visible,
+      .room-choice:hover,
+      .room-choice:focus-visible {
+        transform: translateY(-1px);
+        border-color: var(--line-strong);
+      }
+      .control-shell {
+        padding: 1rem;
+        display: grid;
+        gap: 1rem;
+      }
+      .transport-head {
+        display: grid;
+        gap: 0.55rem;
+        justify-items: center;
+        text-align: center;
+      }
+      .state-pill.good {
+        color: var(--good);
+        border-color: rgba(116, 221, 180, 0.28);
+        background: var(--good-soft);
+      }
+      .state-pill.warn {
+        color: var(--warn);
+        border-color: rgba(255, 183, 112, 0.25);
+        background: var(--warn-soft);
+      }
+      .transport-head h2 {
+        margin: 0;
+        font-size: clamp(1.7rem, 4vw, 2.3rem);
+        line-height: 1.02;
+      }
+      .chips {
+        display: flex;
+        gap: 0.45rem;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 0.26rem 0.68rem;
+        background: rgba(135, 214, 255, 0.08);
+        color: var(--accent);
+        font-size: 0.8rem;
+        font-weight: 600;
+      }
+      .chip.good {
+        background: var(--good-soft);
+        color: var(--good);
+      }
+      .chip.warn {
+        background: var(--warn-soft);
+        color: var(--warn);
+      }
+      .chip.bad {
+        background: var(--bad-soft);
+        color: var(--bad);
+      }
+      .transport-actions {
+        display: flex;
+        justify-content: center;
+        gap: 0.7rem;
+        flex-wrap: wrap;
+      }
+      .metric-strip {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.75rem;
+      }
+      .metric {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--surface);
+        padding: 0.9rem;
+        text-align: center;
+      }
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.74rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-family: var(--mono);
+      }
+      .metric strong {
+        display: block;
+        margin-top: 0.4rem;
+        font-size: 1rem;
+        line-height: 1.35;
+      }
+      .alert-stack {
+        display: grid;
+        gap: 0.75rem;
+      }
+      .banner {
+        border-radius: 12px;
+        padding: 0.82rem 0.95rem;
+        font-weight: 600;
+        border: 1px solid var(--line);
+      }
+      .banner.ok {
+        background: var(--good-soft);
+        color: var(--good);
+      }
+      .banner.error {
+        background: var(--bad-soft);
+        color: var(--bad);
+      }
+      .data-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+        padding: 1rem;
+      }
+      .block,
+      .reports {
+        padding: 1rem;
+      }
+      .block {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--surface);
+      }
+      .reports {
+        padding-top: 0.85rem;
+      }
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        align-items: baseline;
+        margin-bottom: 0.8rem;
+      }
+      .section-head strong {
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-family: var(--mono);
+      }
+      .section-head p {
+        font-size: 0.86rem;
+      }
+      .listener-list {
+        display: grid;
+        gap: 0.6rem;
+      }
+      .listener-item {
+        padding: 0.72rem 0.8rem;
+        border-radius: 14px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+      }
+      .listener-item strong {
+        display: block;
+        font-size: 0.95rem;
+      }
+      .listener-meta {
+        margin-top: 0.22rem;
+        color: var(--muted);
+        font-size: 0.88rem;
+        line-height: 1.5;
+      }
+      .empty-state {
+        color: var(--muted);
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      .history-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 0.8rem;
+        min-width: 640px;
+      }
+      .history-table th,
+      .history-table td {
+        text-align: left;
+        padding: 0.72rem 0.45rem;
+        border-top: 1px solid var(--line);
+        vertical-align: top;
+      }
+      .history-table th {
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 0.8rem;
+        font-family: var(--mono);
+      }
+      .history-link {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 700;
+      }
+      .room-dialog {
+        width: min(100%, 640px);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(12, 20, 30, 0.98);
+        color: var(--text);
+        box-shadow: var(--shadow);
+        padding: 0;
+      }
+      .room-dialog::backdrop {
+        background: rgba(3, 8, 14, 0.7);
+        backdrop-filter: blur(6px);
+      }
+      .dialog-body {
+        padding: 1rem;
+        display: grid;
+        gap: 1rem;
+      }
+      .dialog-head {
+        display: grid;
+        gap: 0.35rem;
+        justify-items: center;
+        text-align: center;
+      }
+      .dialog-head h2 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+      .room-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.85rem;
+      }
+      .room-grid form {
+        margin: 0;
+      }
+      .room-choice {
+        width: 100%;
+        display: grid;
+        gap: 0.35rem;
+        text-align: center;
+        padding: 1rem;
+        cursor: pointer;
+      }
+      .room-choice strong {
+        font-size: 1.02rem;
+      }
+      .room-choice p {
+        margin: 0;
+      }
+      .dialog-actions {
+        display: flex;
+        justify-content: center;
+      }
+      @media (max-width: 900px) {
+        .topbar {
+          grid-template-columns: 1fr;
+          justify-items: start;
+        }
+        .brand {
+          justify-items: start;
+          text-align: left;
+        }
+        .top-actions {
+          justify-self: start;
+        }
+        .metric-strip,
+        .data-grid {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+      @media (max-width: 720px) {
+        main {
+          padding: 0.8rem 0.8rem 2rem;
+        }
+        .metric-strip,
+        .data-grid,
+        .room-grid {
+          grid-template-columns: 1fr;
+        }
+        .transport-actions,
+        .dialog-actions,
+        .top-actions {
+          width: 100%;
+        }
+        .transport-actions form,
+        .transport-actions button,
+        .transport-actions a,
+        .top-actions form,
+        .top-actions a,
+        .top-actions button,
+        .dialog-actions button,
+        .primary-button,
+        .secondary-button,
+        .ghost-button,
+        .utility-button {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="topbar">
+        <a class="utility-button" href="{{ settings_url }}">Settings</a>
+        <div class="brand">
+          <span class="eyebrow">Control Panel</span>
+          <h1>{{ project_name }}</h1>
+          <p>Start or stop the line, then keep an eye on who is listening.</p>
+        </div>
+        <div class="top-actions">
+          <form method="post" action="{{ logout_url }}">
+            <button class="utility-button" type="submit">Sign Out</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel control-shell">
+        <div class="transport-head">
+          <span class="state-pill {% if call_state.tone != 'idle' %}{{ call_state.tone }}{% endif %}">{{ call_state.label }}</span>
+          <h2>{{ call_state.headline }}</h2>
+          <p>{{ call_state.detail }}</p>
+          {% if control_host %}
+          <div class="chips">
+            <span class="chip {% if control_host.source_online %}good{% else %}warn{% endif %}">
+              {% if control_host.source_online %}Agent online{% else %}Agent offline{% endif %}
+            </span>
+            <span class="chip {% if control_host.broadcasting %}good{% elif control_host.desired_active %}warn{% endif %}">
+              {% if control_host.broadcasting %}Live audio{% elif control_host.desired_active %}Starting{% else %}Idle{% endif %}
+            </span>
+            <span class="chip">{{ control_host.room_alias }}</span>
+          </div>
+          {% endif %}
+        </div>
+
+        <div class="transport-actions">
+          {% if active_meeting %}
+          <form method="post" action="{{ url_for('admin_stop_call') }}">
+            <input type="hidden" name="room_slug" value="{{ active_room_slug }}">
+            <button class="secondary-button" type="submit">Stop Call</button>
+          </form>
+          <button class="ghost-button" type="button" data-open-room-dialog>Change Room</button>
+          {% else %}
+          <button class="primary-button" type="button" data-open-room-dialog>Start Call</button>
+          {% endif %}
+          {% if resume_available %}
+          <form method="post" action="{{ url_for('admin_use_schedule') }}">
+            <button class="ghost-button" type="submit">Return to Auto</button>
+          </form>
+          {% endif %}
+        </div>
+
+        <div class="metric-strip">
+          <div class="metric">
+            <span>Room</span>
+            <strong>{{ control_host.room_alias if control_host else "No room selected" }}</strong>
+          </div>
+          <div class="metric">
+            <span>Agent</span>
+            <strong>{% if control_host and control_host.source_online %}Online{% elif control_host %}Offline{% else %}Waiting{% endif %}</strong>
+          </div>
+          <div class="metric">
+            <span>Input</span>
+            <strong>{{ control_host.current_device if control_host and control_host.current_device else "Waiting for input" }}</strong>
+          </div>
+          <div class="metric">
+            <span>Listeners</span>
+            <strong>{{ focus_host.listener_count if focus_host else 0 }}</strong>
+          </div>
+        </div>
+
+        <div class="alert-stack">
+          {% if message %}
+          <div class="banner ok">{{ message }}</div>
+          {% endif %}
+          {% if error %}
+          <div class="banner error">{{ error }}</div>
+          {% endif %}
+          {% for conflict in conflicts %}
+          <div class="banner error">{{ conflict }}</div>
+          {% endfor %}
+          {% if focus_host and focus_host.last_error %}
+          <div class="banner error">{{ focus_host.last_error }}</div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="panel data-grid">
+        <article class="block">
+          <div class="section-head">
+            <strong>Current callers</strong>
+            <p>{% if focus_host %}{{ focus_host.room_alias }}{% else %}No room selected{% endif %}</p>
+          </div>
+          {% if current_listeners %}
+          <div class="listener-list">
+            {% for listener in current_listeners %}
+            <div class="listener-item">
+              <strong>{{ listener.participant_label }}</strong>
+              <div class="listener-meta">{{ listener.location_label or "Location unavailable" }} · {{ listener.channel }}</div>
+              <div class="listener-meta">Joined {{ listener.joined_label }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="empty-state">Nobody is connected right now.</p>
+          {% endif %}
+        </article>
+
+        <article class="block">
+          <div class="section-head">
+            <strong>Recent callers</strong>
+            <p>Latest activity</p>
+          </div>
+          {% if recent_listeners %}
+          <div class="listener-list">
+            {% for listener in recent_listeners %}
+            <div class="listener-item">
+              <strong>{{ listener.participant_label }}</strong>
+              <div class="listener-meta">{{ listener.location_label or "Location unavailable" }} · {{ listener.channel }}</div>
+              <div class="listener-meta">Joined {{ listener.joined_label }}{% if listener.left_at %} · Left {{ listener.left_label }}{% endif %}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="empty-state">No recent listener activity yet.</p>
+          {% endif %}
+        </article>
+      </section>
+
+      <section class="panel reports">
+        <div class="section-head">
+          <strong>Past calls</strong>
+          <p>Download CSV reports</p>
+        </div>
+        <div class="table-wrap">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Room</th>
+                <th>Started</th>
+                <th>Duration</th>
+                <th>Listeners</th>
+                <th>Incidents</th>
+                <th>Report</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for meeting in call_history %}
+              <tr>
+                <td>{{ meeting.room_alias }}</td>
+                <td>{{ meeting.started_label }}</td>
+                <td>{{ meeting.duration_text }}</td>
+                <td>{{ meeting.listener_count }}</td>
+                <td>{{ meeting.incident_count }}</td>
+                <td><a class="history-link" href="{{ url_for('admin_report_download', meeting_id=meeting.id) }}">Download</a></td>
+              </tr>
+              {% else %}
+              <tr>
+                <td colspan="6">No past calls yet.</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <dialog class="room-dialog" id="room-dialog">
+        <div class="dialog-body">
+          <div class="dialog-head">
+            <span class="eyebrow">Start Call</span>
+            <h2>Choose a room</h2>
+            <p>Only one room runs at a time.</p>
+          </div>
+          <div class="room-grid">
+            {% for room in room_options %}
+            <form method="post" action="{{ url_for('admin_start_call') }}">
+              <input type="hidden" name="room_slug" value="{{ room.slug }}">
+              <button class="room-choice" type="submit">
+                <strong>{{ room.alias }}</strong>
+                <p>{{ room.label }}</p>
+                <div class="chips">
+                  <span class="chip {% if room.online %}good{% else %}warn{% endif %}">{% if room.online %}Agent online{% else %}Agent offline{% endif %}</span>
+                  <span class="chip {% if room.active %}good{% endif %}">{% if room.active %}Live{% else %}Standby{% endif %}</span>
+                </div>
+              </button>
+            </form>
+            {% endfor %}
+          </div>
+          <div class="dialog-actions">
+            <button class="close-button" type="button" data-close-room-dialog>Close</button>
+          </div>
+        </div>
+      </dialog>
+
+      <script>
+        (() => {
+          const roomDialog = document.getElementById("room-dialog");
+          if (!roomDialog) {
+            return;
+          }
+          document.querySelectorAll("[data-open-room-dialog]").forEach((button) => {
+            button.addEventListener("click", () => roomDialog.showModal());
+          });
+          document.querySelectorAll("[data-close-room-dialog]").forEach((button) => {
+            button.addEventListener("click", () => roomDialog.close());
+          });
+        })();
+      </script>
+    </main>
+  </body>
+</html>
+"""
+
+
+ADMIN_PANEL_TEMPLATE = ADMIN_TEMPLATE
+
+
 SETTINGS_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -3482,6 +4347,9 @@ SETTINGS_TEMPLATE = """
         padding: 0.74rem 0.92rem;
         font-weight: 700;
         cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
       }
       .primary-button {
         padding: 0.84rem 1.4rem;
@@ -3549,14 +4417,14 @@ SETTINGS_TEMPLATE = """
         box-shadow: inset 0 0 0 1px rgba(135, 214, 255, 0.12);
       }
       .workspace {
-        padding: 1rem;
+        padding: 1rem 1rem 1.15rem;
       }
       .workspace.is-hidden {
         display: none;
       }
       .workspace form {
         display: grid;
-        gap: 1rem;
+        gap: 1.1rem;
       }
       .workspace-head {
         display: flex;
@@ -3591,7 +4459,8 @@ SETTINGS_TEMPLATE = """
       .workspace-grid {
         display: grid;
         grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
-        gap: 1rem;
+        gap: 1.15rem;
+        align-items: start;
       }
       .workspace-stack {
         display: grid;
@@ -3608,7 +4477,7 @@ SETTINGS_TEMPLATE = """
         display: flex;
         justify-content: space-between;
         gap: 0.8rem;
-        align-items: baseline;
+        align-items: start;
         margin-bottom: 0.85rem;
       }
       .block-head strong {
@@ -3652,6 +4521,7 @@ SETTINGS_TEMPLATE = """
       input[type="time"],
       select {
         width: 100%;
+        min-width: 0;
         border: 1px solid var(--line);
         border-radius: 10px;
         background: var(--surface-2);
@@ -3664,9 +4534,10 @@ SETTINGS_TEMPLATE = """
         gap: 0.7rem;
       }
       .order-row {
-        display: flex;
+        display: grid;
+        grid-template-columns: 6.4rem minmax(0, 1fr);
         align-items: center;
-        gap: 0.85rem;
+        gap: 0.75rem;
       }
       .order-row span {
         min-width: 6.5rem;
@@ -3681,14 +4552,14 @@ SETTINGS_TEMPLATE = """
       }
       .schedule-shell {
         display: grid;
-        gap: 0.8rem;
+        gap: 0.9rem;
       }
       .schedule-head,
       .schedule-row {
         display: grid;
-        grid-template-columns: 5.5rem 5.5rem minmax(0, 1fr) minmax(0, 1fr) 6.25rem;
-        gap: 0.6rem;
-        align-items: center;
+        grid-template-columns: 5.4rem 4.75rem minmax(8rem, 1fr) minmax(8rem, 1fr) auto;
+        gap: 0.7rem;
+        align-items: stretch;
       }
       .schedule-head {
         padding: 0 0.1rem;
@@ -3706,11 +4577,15 @@ SETTINGS_TEMPLATE = """
         border-radius: 12px;
         border: 1px solid var(--line);
         background: var(--surface-2);
-        padding: 0.75rem;
+        padding: 0.7rem;
       }
       .schedule-cell {
         display: grid;
         gap: 0.35rem;
+      }
+      .row-button {
+        align-self: stretch;
+        min-width: 5.75rem;
       }
       .schedule-cell span {
         display: none;
@@ -3730,6 +4605,7 @@ SETTINGS_TEMPLATE = """
       .save-bar {
         display: flex;
         justify-content: center;
+        padding-top: 0.15rem;
       }
       @media (max-width: 900px) {
         .topbar {
@@ -3761,12 +4637,14 @@ SETTINGS_TEMPLATE = """
         .order-row {
           display: grid;
           gap: 0.4rem;
+          grid-template-columns: 1fr;
         }
         .schedule-head {
           display: none;
         }
         .schedule-row {
           grid-template-columns: 1fr;
+          padding: 0.85rem;
         }
         .schedule-cell span {
           display: inline-flex;

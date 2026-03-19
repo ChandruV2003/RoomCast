@@ -58,7 +58,7 @@ Current limitation: the agent does not yet power-cycle USB devices or restart Fo
 ## Setting up a new source laptop
 
 1. Copy the WebCall files to the laptop
-2. Install Python 3.12 and ffmpeg
+2. Install Python 3.12+ and ffmpeg
 3. Get the host slug and heartbeat token from the server
 4. Run the install script:
 
@@ -70,10 +70,11 @@ Current limitation: the agent does not yet power-cycle USB devices or restart Fo
   -TaskName "WebCall Source Agent"
 ```
 
-5. Confirm the task is running
-6. Open the control panel and verify the new host shows `Agent online`
-7. Open `Settings` and confirm the known device list is populated for that host
-8. Set the input order for that host so the preferred device is first
+5. The installer will stop stale RoomCast host processes, refresh the task, and start it immediately
+6. Confirm the task is running
+7. Open the control panel and verify the new host shows `Agent online`
+8. Open `Settings` and confirm the known device list is populated for that host
+9. Set the input order for that host so the preferred device is first
 
 That is enough for another Windows source laptop to join the system. The server stays the same; the only host-specific values are the slug and heartbeat token.
 

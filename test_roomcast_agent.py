@@ -49,6 +49,31 @@ class RoomCastAgentTests(unittest.TestCase):
         chosen = agent.choose_device(["Microphone (Scarlett Solo 4th Gen)"])
         self.assertEqual(chosen, "Microphone (Scarlett Solo 4th Gen)")
 
+    def test_restart_ingest_switches_to_new_device_immediately(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+        agent.current_device = "Headset Microphone (Realtek(R) Audio)"
+        agent.restart_not_before = 60
+
+        events = []
+        agent.stop_ingest = lambda reason=None: events.append(("stop", reason))
+        agent.start_ingest = lambda ingest_url, device_name: events.append(("start", ingest_url, device_name))
+
+        agent.restart_ingest(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Analogue 1 + 2 (3- Focusrite USB Audio)",
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("stop", "Switching to preferred input: Analogue 1 + 2 (3- Focusrite USB Audio)"),
+                ("start", "https://example.com/webcall/api/source/ingest/test-host", "Analogue 1 + 2 (3- Focusrite USB Audio)"),
+            ],
+        )
+        self.assertEqual(agent.restart_not_before, 0.0)
+        self.assertEqual(agent.last_error, "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -331,6 +331,14 @@ class RoomCastAgent:
             self._ffmpeg_log_handle.close()
             self._ffmpeg_log_handle = None
 
+    def restart_ingest(self, ingest_url: str, device_name: str):
+        if self.current_device == device_name and self._process_is_running():
+            return
+        self.stop_ingest(reason=f"Switching to preferred input: {device_name}")
+        self.restart_not_before = 0.0
+        self.last_error = ""
+        self.start_ingest(ingest_url, device_name)
+
     def write_status(self, server_reply=None):
         payload = {
             "host_slug": self.host_slug,
@@ -357,20 +365,24 @@ class RoomCastAgent:
                     self.last_error = ""
 
                 if self.desired_active:
+                    device_name = self.choose_device(
+                        reply.get("device_order"),
+                        reply.get("preferred_audio_pattern"),
+                        reply.get("fallback_audio_pattern"),
+                    )
                     if not self._process_is_running():
                         if time.time() < self.restart_not_before:
                             self.write_status(server_reply=reply)
                             time.sleep(self.poll_interval)
                             continue
-                        device_name = self.choose_device(
-                            reply.get("device_order"),
-                            reply.get("preferred_audio_pattern"),
-                            reply.get("fallback_audio_pattern"),
-                        )
                         if not device_name:
                             self.last_error = "No compatible input device was found."
                         else:
                             self.start_ingest(reply["ingest_url"], device_name)
+                    elif not device_name:
+                        self.last_error = "No compatible input device was found."
+                    elif device_name != self.current_device:
+                        self.restart_ingest(reply["ingest_url"], device_name)
                     elif self.process and self.process.poll() not in (None, 0):
                         self.last_error = f"ffmpeg exited with code {self.process.returncode}"
                 else:

@@ -85,7 +85,8 @@ Important environment values:
   -TaskName "WebCall Source Agent"
 ```
 
-5. Sign into Windows and confirm the scheduled task is running.
+5. The installer will register the task, clear stale RoomCast agent processes for that host, and start the task immediately.
+6. Sign into Windows and confirm the scheduled task is running.
 6. Open the admin panel and check that:
    - the host shows `Agent online`
    - the known input list appears under `Settings`
@@ -103,3 +104,4 @@ Important environment values:
 
 - PSTN dial-in is not provisioned yet. The app-side telephony hooks exist, but no paid number is active.
 - The agent handles publish/retry logic, not USB driver restarts.
+- The installer auto-detects `py -3.13`, `-3.12`, `-3.11`, then `-3` in that order unless you pass `-PythonSelector`.

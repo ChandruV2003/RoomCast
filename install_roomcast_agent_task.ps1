@@ -11,7 +11,7 @@ param(
     [string]$RepoPath = (Split-Path -Parent $PSCommandPath),
     [string]$TaskName = "WebCall Source Agent",
     [string]$PythonLauncher = "py",
-    [string]$PythonSelector = "-3.12"
+    [string]$PythonSelector = ""
 )
 
 $resolvedRepo = (Resolve-Path $RepoPath).Path
@@ -20,10 +20,37 @@ if (-not (Test-Path $agentScript)) {
     throw "roomcast_agent.py was not found in $resolvedRepo"
 }
 
+$resolvedPythonSelector = $PythonSelector
+if (-not $resolvedPythonSelector) {
+    foreach ($candidate in @("-3.13", "-3.12", "-3.11", "-3")) {
+        & $PythonLauncher $candidate -c "import sys" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $resolvedPythonSelector = $candidate
+            break
+        }
+    }
+}
+
+if (-not $resolvedPythonSelector) {
+    throw "Could not find a usable Python launcher target via '$PythonLauncher'. Pass -PythonSelector explicitly."
+}
+
+$agentLaunch = @(
+    "& $PythonLauncher"
+    $resolvedPythonSelector
+    "'$agentScript'"
+    "--server-url '$ServerUrl'"
+    "--host-slug '$HostSlug'"
+    "--token '$Token'"
+) -join " "
+
 $command = @(
     "Set-Location '$resolvedRepo'"
-    "& $PythonLauncher $PythonSelector '$agentScript' --server-url '$ServerUrl' --host-slug '$HostSlug' --token '$Token'"
+    $agentLaunch
 ) -join "; "
+
+$runtimeDir = Join-Path $resolvedRepo "runtime"
+$lockPath = Join-Path $runtimeDir "$HostSlug-roomcast-agent.lock"
 
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
@@ -36,6 +63,33 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew
 
+try {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+} catch {
+}
+
+Get-CimInstance Win32_Process |
+    Where-Object { $_.CommandLine -match "roomcast_agent.py" } |
+    ForEach-Object {
+        try {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        } catch {
+        }
+    }
+
+Get-CimInstance Win32_Process |
+    Where-Object { $_.Name -match "ffmpeg" -and $_.CommandLine -match [Regex]::Escape($HostSlug) } |
+    ForEach-Object {
+        try {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        } catch {
+        }
+    }
+
+if (Test-Path $lockPath) {
+    Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+}
+
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
@@ -43,5 +97,7 @@ Register-ScheduledTask `
     -Settings $settings `
     -Description "WebCall source agent for $HostSlug" `
     -Force | Out-Null
+
+Start-ScheduledTask -TaskName $TaskName
 
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State, Author
