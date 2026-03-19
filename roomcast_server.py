@@ -13,6 +13,7 @@ import secrets
 import time
 import csv
 import io
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from urllib.request import urlopen
@@ -25,8 +26,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from roomcast_store import RoomCastStore
 
 
-LISTENER_QUEUE_MAXSIZE = 8
-INGEST_CHUNK_SIZE = 4096
+LISTENER_QUEUE_MAXSIZE = 6
+INGEST_CHUNK_SIZE = 2048
+RECENT_CHUNK_BACKLOG = 24
+LIVE_SNAPSHOT_WAIT_SECONDS = 6.0
+LIVE_SNAPSHOT_POLL_SECONDS = 0.2
 
 
 STATUS_TTL_SECONDS = 45
@@ -57,6 +61,7 @@ class RoomState:
     last_chunk_at: str | None = None
     bytes_received: int = 0
     listeners: dict[int, queue.Queue] = field(default_factory=dict)
+    recent_chunks: deque[bytes] = field(default_factory=lambda: deque(maxlen=RECENT_CHUNK_BACKLOG))
 
 
 class RoomStreamHub:
@@ -79,12 +84,14 @@ class RoomStreamHub:
             room.started_at = datetime.now(timezone.utc).isoformat()
             room.last_chunk_at = None
             room.bytes_received = 0
+            room.recent_chunks.clear()
 
     def publish(self, room_slug: str, chunk: bytes):
         with self._lock:
             room = self._get_room(room_slug)
             room.last_chunk_at = datetime.now(timezone.utc).isoformat()
             room.bytes_received += len(chunk)
+            room.recent_chunks.append(chunk)
             listeners = list(room.listeners.values())
 
         for listener in listeners:
@@ -124,8 +131,11 @@ class RoomStreamHub:
         with self._lock:
             room = self._get_room(room_slug)
             room.listeners[listener_id] = listener
+            buffered_chunks = list(room.recent_chunks)
 
         try:
+            if buffered_chunks:
+                yield b"".join(buffered_chunks)
             while True:
                 try:
                     chunk = listener.get(timeout=25)
@@ -614,6 +624,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         return any(
             (
                 snapshot["broadcasting"],
+                snapshot.get("is_ingesting"),
                 snapshot["desired_active"],
                 snapshot["schedule_active"],
             )
@@ -677,6 +688,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             "schedule_active": host["schedule_active"] if host else False,
             "source_online": _runtime_online(host),
             "runtime": host["runtime"] if host else None,
+            "is_ingesting": bool((host["runtime"] or {}).get("is_ingesting")) if host else False,
             "broadcasting": hub_status["broadcasting"],
             "listener_count": hub_status["listener_count"],
             "last_chunk_at": hub_status["last_chunk_at"],
@@ -738,6 +750,34 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         signaled = [item for item in candidates if _has_public_signal(item[0])]
         return _select_public_room(signaled)
 
+    def _admin_monitor_room(preferred_room_slug: str | None = None):
+        preferred = (preferred_room_slug or "").strip()
+        if preferred in VISIBLE_ROOM_SLUGS:
+            snapshot = _room_snapshot(preferred)
+            if snapshot and snapshot["enabled"]:
+                return snapshot
+
+        candidates = []
+        for room_slug in VISIBLE_ROOM_SLUGS:
+            snapshot = _room_snapshot(room_slug)
+            if not snapshot or not snapshot["enabled"]:
+                continue
+            candidates.append((snapshot, 0))
+        return _select_public_room(candidates)
+
+    def _await_snapshot(snapshot_resolver, *, timeout: float = LIVE_SNAPSHOT_WAIT_SECONDS):
+        snapshot = snapshot_resolver()
+        if snapshot:
+            return snapshot
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(LIVE_SNAPSHOT_POLL_SECONDS)
+            snapshot = snapshot_resolver()
+            if snapshot:
+                return snapshot
+        return None
+
     def _live_snapshot():
         snapshot = _active_public_room()
         if snapshot:
@@ -754,6 +794,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             "schedule_active": False,
             "source_online": False,
             "runtime": None,
+            "is_ingesting": False,
             "broadcasting": False,
             "listener_count": 0,
             "last_chunk_at": None,
@@ -896,13 +937,19 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         if not _is_admin():
             return redirect(url_for("admin_entry", error="Admin password required."))
 
+        context = _panel_context()
         return render_template_string(
             ADMIN_PANEL_TEMPLATE,
             project_name=_project_name(),
-            **_panel_context(),
+            **context,
             conflicts=_ingest_conflicts(_visible_hosts()),
             message=request.args.get("message"),
             error=request.args.get("error"),
+            admin_stream_url=url_for(
+                "listen_live",
+                monitor=1,
+                room=((context.get("control_host") or {}).get("room_slug") or ""),
+            ),
             logout_url=url_for("admin_logout"),
             settings_url=url_for("admin_settings"),
         )
@@ -1098,10 +1145,17 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     @app.get("/listen/live.mp3")
     def listen_live():
-        if not _authorized_rooms():
+        admin_monitor = request.args.get("monitor") == "1" and _is_admin()
+        preferred_room_slug = (request.args.get("room") or "").strip()
+        if not admin_monitor and not _authorized_rooms():
             return jsonify({"error": "pin required"}), 403
 
-        snapshot = _active_public_room()
+        snapshot_resolver = (
+            (lambda: _admin_monitor_room(preferred_room_slug))
+            if admin_monitor
+            else _active_public_room
+        )
+        snapshot = _await_snapshot(snapshot_resolver)
         if not snapshot:
             headers = {
                 "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -1113,20 +1167,23 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         room_slug = snapshot["slug"]
         participant_label = session.get("listener_name") or f"Web {request.headers.get('X-Forwarded-For', request.remote_addr or 'listener')}"
         participant_key = session.get("listener_key") or request.cookies.get(app.config.get("SESSION_COOKIE_NAME", "session"), "")
-        listener_session_id = roomcast_store.begin_listener_session(
-            room_slug,
-            channel="web",
-            participant_label=participant_label,
-            participant_key=participant_key or participant_label,
-            ip_address=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
-            user_agent=request.headers.get("User-Agent", ""),
-        )
+        listener_session_id = None
+        if not admin_monitor:
+            listener_session_id = roomcast_store.begin_listener_session(
+                room_slug,
+                channel="web",
+                participant_label=participant_label,
+                participant_key=participant_key or participant_label,
+                ip_address=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+                user_agent=request.headers.get("User-Agent", ""),
+            )
 
         def _stream():
             try:
                 yield from stream_hub.listen(room_slug)
             finally:
-                roomcast_store.end_listener_session(listener_session_id)
+                if listener_session_id is not None:
+                    roomcast_store.end_listener_session(listener_session_id)
 
         headers = {
             "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -1642,7 +1699,8 @@ ROOM_TEMPLATE = """
         display: none;
       }
       .meter {
-        margin-top: 1rem;
+        display: grid;
+        gap: 0.8rem;
       }
       .meter-head {
         display: flex;
@@ -1653,20 +1711,43 @@ ROOM_TEMPLATE = """
         font-size: 0.9rem;
         font-weight: 600;
       }
-      .meter-track {
-        margin-top: 0.45rem;
-        height: 16px;
-        border-radius: 999px;
-        overflow: hidden;
-        background: rgba(112, 209, 255, 0.08);
-        border: 1px solid rgba(112, 209, 255, 0.12);
+      .meter-visual {
+        display: flex;
+        justify-content: center;
+        gap: 0.9rem;
+        align-items: end;
+        min-height: 11rem;
+        padding: 0.25rem 0;
       }
-      .meter-fill {
-        height: 100%;
-        width: 4%;
-        border-radius: inherit;
-        background: linear-gradient(90deg, #57c7ff, #67efc0, #ffb65b);
-        transition: width 120ms linear;
+      .meter-column {
+        display: flex;
+        flex-direction: column-reverse;
+        gap: 0.34rem;
+      }
+      .meter-segment {
+        width: 1.55rem;
+        height: 0.66rem;
+        border-radius: 999px;
+        background: rgba(135, 214, 255, 0.08);
+        border: 1px solid rgba(135, 214, 255, 0.08);
+        transition: background 120ms linear, border-color 120ms linear, transform 120ms linear;
+      }
+      .meter-segment.is-on[data-band="low"] {
+        background: #74ff77;
+        border-color: rgba(116, 255, 119, 0.52);
+      }
+      .meter-segment.is-on[data-band="mid"] {
+        background: #d5ff4a;
+        border-color: rgba(213, 255, 74, 0.5);
+      }
+      .meter-segment.is-on[data-band="high"] {
+        background: #ffb84a;
+        border-color: rgba(255, 184, 74, 0.48);
+      }
+      .meter-segment.is-on[data-band="peak"] {
+        background: #ff6b3d;
+        border-color: rgba(255, 107, 61, 0.58);
+        transform: translateY(-1px);
       }
       .slider-wrap {
         margin-top: 1rem;
@@ -1701,6 +1782,10 @@ ROOM_TEMPLATE = """
         .player-shell {
           border-radius: 14px;
         }
+        .meter-segment {
+          width: 1.3rem;
+          height: 0.58rem;
+        }
       }
     </style>
   </head>
@@ -1716,8 +1801,11 @@ ROOM_TEMPLATE = """
         <section class="stack">
           <article class="panel">
             <div class="chips">
-              <span class="chip {% if room.broadcasting %}good{% endif %}" id="broadcast-chip">
-                {% if room.broadcasting %}Meeting active now{% else %}Waiting for meeting{% endif %}
+              <span
+                class="chip {% if room.broadcasting %}good{% elif room.is_ingesting or room.desired_active %}warn{% endif %}"
+                id="broadcast-chip"
+              >
+                {% if room.broadcasting or room.is_ingesting or room.desired_active %}Connecting audio{% else %}Waiting for meeting{% endif %}
               </span>
             </div>
 
@@ -1727,10 +1815,19 @@ ROOM_TEMPLATE = """
               <div class="meter">
                 <div class="meter-head">
                   <span>Volume meter</span>
-                  <span id="meter-label">Idle</span>
+                  <span id="meter-label">{% if room.broadcasting or room.is_ingesting or room.desired_active %}Connecting{% else %}Idle{% endif %}</span>
                 </div>
-                <div class="meter-track">
-                  <div class="meter-fill" id="meter-fill"></div>
+                <div class="meter-visual" id="meter-visual">
+                  <div class="meter-column" data-meter-column="left">
+                    {% for band in ["low", "low", "low", "low", "mid", "mid", "mid", "mid", "mid", "high", "high", "high", "peak", "peak"] %}
+                    <span class="meter-segment" data-band="{{ band }}"></span>
+                    {% endfor %}
+                  </div>
+                  <div class="meter-column" data-meter-column="right">
+                    {% for band in ["low", "low", "low", "low", "mid", "mid", "mid", "mid", "mid", "high", "high", "high", "peak", "peak"] %}
+                    <span class="meter-segment" data-band="{{ band }}"></span>
+                    {% endfor %}
+                  </div>
                 </div>
               </div>
 
@@ -1745,13 +1842,15 @@ ROOM_TEMPLATE = """
 
             <div class="small" id="small">
               {% if room.broadcasting %}
-              Meeting active now.
+              Connecting live audio...
+              {% elif room.is_ingesting or room.desired_active %}
+              Connecting audio...
               {% else %}
               Meeting not active right now. Leave this page open and it will reconnect when the audio begins.
               {% endif %}
             </div>
 
-            <audio id="stream-player" playsinline preload="auto" src="{{ stream_url }}"></audio>
+            <audio id="stream-player" playsinline preload="auto" autoplay src="{{ stream_url }}"></audio>
           </article>
         </section>
       </section>
@@ -1762,19 +1861,19 @@ ROOM_TEMPLATE = """
       const listenButton = document.getElementById("listen-button");
       const volumeSlider = document.getElementById("volume-slider");
       const volumeValue = document.getElementById("volume-value");
-      const meterFill = document.getElementById("meter-fill");
+      const meterColumns = [...document.querySelectorAll("[data-meter-column]")];
       const meterLabel = document.getElementById("meter-label");
       const broadcastChip = document.getElementById("broadcast-chip");
       const small = document.getElementById("small");
-      let roomActive = {{ "true" if room.broadcasting else "false" }};
+      let roomActive = {{ "true" if room.broadcasting or room.is_ingesting or room.desired_active else "false" }};
       let audioContext;
       let analyser;
       let sourceNode;
+      let gainNode;
       let meterData;
 
       function canUseMeter() {
-        const activation = navigator.userActivation || document.userActivation;
-        return !activation || activation.hasBeenActive;
+        return true;
       }
 
       function rebuildStreamUrl() {
@@ -1793,6 +1892,16 @@ ROOM_TEMPLATE = """
         }
       }
 
+      function paintMeter(percent) {
+        const clamped = Math.max(0, Math.min(100, percent));
+        const litSegments = Math.round((clamped / 100) * 14);
+        meterColumns.forEach((column) => {
+          [...column.children].forEach((segment, index) => {
+            segment.classList.toggle("is-on", index < litSegments);
+          });
+        });
+      }
+
       function connectMeter() {
         if (sourceNode || !(window.AudioContext || window.webkitAudioContext) || !canUseMeter()) {
           return;
@@ -1800,11 +1909,14 @@ ROOM_TEMPLATE = """
         const Context = window.AudioContext || window.webkitAudioContext;
         audioContext = audioContext || new Context();
         sourceNode = audioContext.createMediaElementSource(audio);
+        gainNode = audioContext.createGain();
         analyser = audioContext.createAnalyser();
         analyser.fftSize = 512;
         analyser.smoothingTimeConstant = 0.82;
         meterData = new Uint8Array(analyser.frequencyBinCount);
-        sourceNode.connect(analyser);
+        gainNode.gain.value = Number(volumeSlider.value) / 100;
+        sourceNode.connect(gainNode);
+        gainNode.connect(analyser);
         analyser.connect(audioContext.destination);
 
         window.setInterval(() => {
@@ -1816,21 +1928,25 @@ ROOM_TEMPLATE = """
           for (const value of meterData) {
             peak = Math.max(peak, value);
           }
-          const percent = Math.max(4, Math.min(100, Math.round((peak / 255) * 100)));
-          meterFill.style.width = `${percent}%`;
+          const percent = Math.max(0, Math.min(100, Math.round((peak / 255) * 100)));
+          paintMeter(percent);
           meterLabel.textContent = percent <= 6 ? "Idle" : `${percent}%`;
         }, 120);
       }
 
       async function startPlayback() {
-        connectMeter();
-        if (audioContext && audioContext.state === "suspended") {
-          await audioContext.resume();
+        if (roomActive) {
+          meterLabel.textContent = "Connecting";
+          small.textContent = "Connecting audio...";
         }
         try {
           await audio.play();
+          connectMeter();
+          if (audioContext && audioContext.state === "suspended") {
+            await audioContext.resume();
+          }
           listenButton.hidden = true;
-          small.textContent = "Meeting active now.";
+          small.textContent = "Connecting audio...";
         } catch (error) {
           if (roomActive) {
             listenButton.hidden = false;
@@ -1842,28 +1958,51 @@ ROOM_TEMPLATE = """
       }
 
       function refreshAudio() {
+        if (roomActive) {
+          meterLabel.textContent = "Connecting";
+          small.textContent = "Connecting audio...";
+        }
         rebuildStreamUrl();
         startPlayback().catch(() => {});
       }
 
+      function setPublicState(status) {
+        const activeNow = !!status.broadcasting;
+        const connecting = !!status.is_ingesting || !!status.desired_active;
+        const listenerReady = !audio.paused && audio.readyState >= 2;
+        roomActive = activeNow || connecting;
+        if (activeNow && listenerReady) {
+          setChip(broadcastChip, "Meeting active now", "good");
+        } else if (activeNow || connecting) {
+          setChip(broadcastChip, "Connecting audio", "warn");
+        } else {
+          setChip(broadcastChip, "Waiting for meeting", "warn");
+        }
+      }
+
       async function pollStatus() {
         try {
-          const response = await fetch("{{ status_url }}", { cache: "no-store" });
+          const response = await fetch("{{ status_url }}" + "?ts=" + Date.now(), { cache: "no-store" });
           if (!response.ok) {
             return;
           }
           const status = await response.json();
-          roomActive = !!status.broadcasting;
-          setChip(broadcastChip, status.broadcasting ? "Meeting active now" : "Waiting for meeting", status.broadcasting ? "good" : "warn");
-          if (status.broadcasting && audio.paused) {
+          setPublicState(status);
+          if (roomActive && audio.paused) {
             refreshAudio();
           }
-          if (status.last_error) {
-            small.textContent = status.last_error;
-          } else if (status.broadcasting) {
-            small.textContent = "Meeting active now.";
+          if (status.broadcasting) {
+            if (audio.paused || audio.readyState < 2) {
+              small.textContent = "Connecting audio...";
+            } else {
+              small.textContent = "Meeting active now.";
+            }
+          } else if (status.is_ingesting || status.desired_active) {
+            small.textContent = "Connecting audio...";
           } else {
             small.textContent = "Meeting not active right now. Leave this page open and it will reconnect when the audio begins.";
+            paintMeter(0);
+            meterLabel.textContent = "Idle";
           }
         } catch (error) {
           small.textContent = "Status refresh failed. Retrying.";
@@ -1872,7 +2011,10 @@ ROOM_TEMPLATE = """
 
       volumeSlider.addEventListener("input", () => {
         const value = Number(volumeSlider.value);
-        audio.volume = value / 100;
+          audio.volume = value / 100;
+          if (gainNode) {
+            gainNode.gain.value = value / 100;
+          }
         volumeValue.textContent = `${value}%`;
       });
 
@@ -1880,23 +2022,38 @@ ROOM_TEMPLATE = """
         refreshAudio();
       });
       audio.addEventListener("canplay", () => {
+        if (roomActive) {
+          listenButton.hidden = true;
+          meterLabel.textContent = "Live";
+          setChip(broadcastChip, "Meeting active now", "good");
+          small.textContent = "Meeting active now.";
+        }
         if (audio.paused) {
           startPlayback().catch(() => {});
         }
       });
-      audio.addEventListener("ended", () => setTimeout(refreshAudio, 2500));
-      audio.addEventListener("error", () => setTimeout(refreshAudio, 2500));
-      audio.addEventListener("stalled", () => setTimeout(refreshAudio, 1200));
+      audio.addEventListener("ended", () => setTimeout(refreshAudio, 800));
+      audio.addEventListener("error", () => setTimeout(refreshAudio, 800));
+      audio.addEventListener("stalled", () => setTimeout(refreshAudio, 400));
       audio.addEventListener("waiting", () => {
         meterLabel.textContent = "Connecting";
+        setChip(broadcastChip, "Connecting audio", "warn");
+        if (roomActive) {
+          small.textContent = "Connecting audio...";
+        }
       });
       audio.addEventListener("playing", () => {
         listenButton.hidden = true;
-        meterLabel.textContent = "Live";
+        if (audio.readyState >= 2 || audio.currentTime > 0) {
+          meterLabel.textContent = "Live";
+          setChip(broadcastChip, "Meeting active now", "good");
+          small.textContent = "Meeting active now.";
+        }
       });
 
+      paintMeter(0);
       rebuildStreamUrl();
-      setInterval(pollStatus, 2500);
+      setInterval(pollStatus, 750);
       pollStatus();
       if (roomActive) {
         startPlayback().catch(() => {});
@@ -3666,7 +3823,7 @@ ADMIN_TEMPLATE = """
           var(--bg);
       }
       main {
-        max-width: 1040px;
+        max-width: 1120px;
         margin: 0 auto;
         padding: 1rem 1rem 2.5rem;
       }
@@ -3691,6 +3848,8 @@ ADMIN_TEMPLATE = """
       .brand p {
         margin: 0;
         color: var(--muted);
+        max-width: 38rem;
+        line-height: 1.38;
       }
       .top-actions {
         display: flex;
@@ -3753,13 +3912,13 @@ ADMIN_TEMPLATE = """
       .ghost-button,
       .secondary-button,
       .close-button {
-        padding: 0.74rem 0.92rem;
+        padding: 0.82rem 1.08rem;
         font-weight: 700;
         cursor: pointer;
       }
       .primary-button {
         border: 0;
-        padding: 0.98rem 1.5rem;
+        padding: 1rem 1.85rem;
         background: #dff4ff;
         color: #081018;
         font-weight: 800;
@@ -3768,14 +3927,30 @@ ADMIN_TEMPLATE = """
       .primary-button,
       .ghost-button,
       .secondary-button {
-        min-height: 3.2rem;
-        min-width: 11rem;
+        min-height: 4.15rem;
+        min-width: 17rem;
         display: inline-flex;
         align-items: center;
         justify-content: center;
+        font-size: 1.15rem;
+        padding: 1rem 1.7rem;
       }
       .secondary-button {
         color: var(--bad);
+      }
+      .auto-toggle.is-on {
+        background: var(--good-soft);
+        border-color: rgba(116, 221, 180, 0.34);
+        color: var(--good);
+        cursor: default;
+      }
+      .auto-toggle[disabled] {
+        opacity: 1;
+      }
+      .auto-toggle.is-off {
+        background: var(--surface-2);
+        border-color: rgba(255, 183, 112, 0.22);
+        color: var(--warn);
       }
       .utility-button:hover,
       .utility-button:focus-visible,
@@ -3793,13 +3968,13 @@ ADMIN_TEMPLATE = """
         border-color: var(--line-strong);
       }
       .control-shell {
-        padding: 1rem;
+        padding: 1.15rem;
         display: grid;
         gap: 1rem;
       }
       .transport-head {
         display: grid;
-        gap: 0.55rem;
+        gap: 0.45rem;
         justify-items: center;
         text-align: center;
       }
@@ -3815,8 +3990,12 @@ ADMIN_TEMPLATE = """
       }
       .transport-head h2 {
         margin: 0;
-        font-size: clamp(1.7rem, 4vw, 2.3rem);
+        font-size: clamp(1.85rem, 4vw, 2.45rem);
         line-height: 1.02;
+      }
+      .transport-head p {
+        max-width: 36rem;
+        font-size: 0.98rem;
       }
       .chips {
         display: flex;
@@ -3849,8 +4028,16 @@ ADMIN_TEMPLATE = """
       .transport-actions {
         display: flex;
         justify-content: center;
-        gap: 0.7rem;
+        gap: 0.85rem;
         flex-wrap: wrap;
+      }
+      .transport-actions form {
+        margin: 0;
+        display: flex;
+      }
+      .transport-actions form button,
+      .transport-actions > button {
+        min-width: 17rem;
       }
       .metric-strip {
         display: grid;
@@ -3861,26 +4048,94 @@ ADMIN_TEMPLATE = """
         border: 1px solid var(--line);
         border-radius: 14px;
         background: var(--surface);
-        padding: 0.9rem;
+        padding: 1rem;
         text-align: center;
       }
       .metric span {
         display: block;
         color: var(--muted);
-        font-size: 0.74rem;
+        font-size: 0.78rem;
         text-transform: uppercase;
         letter-spacing: 0.08em;
         font-family: var(--mono);
       }
       .metric strong {
         display: block;
-        margin-top: 0.4rem;
-        font-size: 1rem;
-        line-height: 1.35;
+        margin-top: 0.48rem;
+        font-size: 1.84rem;
+        line-height: 1.1;
+      }
+      .metric.is-wide strong {
+        font-size: 1.58rem;
+        line-height: 1.16;
       }
       .alert-stack {
         display: grid;
         gap: 0.75rem;
+      }
+      .monitor-panel {
+        padding: 1.1rem;
+      }
+      .monitor-grid {
+        display: grid;
+        gap: 0.9rem;
+        justify-items: center;
+        width: 100%;
+      }
+      .monitor-title {
+        display: flex;
+        width: 100%;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+      }
+      .monitor-title strong {
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-family: var(--mono);
+      }
+      .monitor-state {
+        color: var(--muted);
+        font-weight: 700;
+      }
+      .meter-visual {
+        display: flex;
+        justify-content: center;
+        gap: 0.8rem;
+        align-items: end;
+        min-height: 9.8rem;
+      }
+      .meter-column {
+        display: flex;
+        flex-direction: column-reverse;
+        gap: 0.3rem;
+      }
+      .meter-segment {
+        width: 1.15rem;
+        height: 0.48rem;
+        border-radius: 999px;
+        background: rgba(135, 214, 255, 0.08);
+        border: 1px solid rgba(135, 214, 255, 0.08);
+        transition: background 120ms linear, border-color 120ms linear, transform 120ms linear;
+      }
+      .meter-segment.is-on[data-band="low"] {
+        background: #74ff77;
+        border-color: rgba(116, 255, 119, 0.52);
+      }
+      .meter-segment.is-on[data-band="mid"] {
+        background: #d5ff4a;
+        border-color: rgba(213, 255, 74, 0.5);
+      }
+      .meter-segment.is-on[data-band="high"] {
+        background: #ffb84a;
+        border-color: rgba(255, 184, 74, 0.48);
+      }
+      .meter-segment.is-on[data-band="peak"] {
+        background: #ff6b3d;
+        border-color: rgba(255, 107, 61, 0.58);
+        transform: translateY(-1px);
       }
       .banner {
         border-radius: 12px;
@@ -3905,6 +4160,7 @@ ADMIN_TEMPLATE = """
         gap: 0.65rem;
         flex-wrap: wrap;
         margin-bottom: 1rem;
+        justify-content: flex-start;
       }
       .view-tab {
         padding: 0.74rem 1rem;
@@ -3927,7 +4183,7 @@ ADMIN_TEMPLATE = """
       }
       .block,
       .reports {
-        padding: 1rem;
+        padding: 1.1rem;
       }
       .block {
         border: 1px solid var(--line);
@@ -3952,7 +4208,7 @@ ADMIN_TEMPLATE = """
         font-family: var(--mono);
       }
       .section-head p {
-        font-size: 0.86rem;
+        font-size: 0.9rem;
       }
       .listener-list {
         display: grid;
@@ -4122,7 +4378,7 @@ ADMIN_TEMPLATE = """
         </div>
       </section>
 
-      <section class="panel control-shell">
+      <section class="panel control-shell" id="control-shell" data-admin-stream-url="{{ admin_stream_url }}">
         <div class="transport-head">
           <span class="state-pill {% if call_state.tone != 'idle' %}{{ call_state.tone }}{% endif %}">{{ call_state.label }}</span>
           <h2>{{ call_state.headline }}</h2>
@@ -4150,9 +4406,15 @@ ADMIN_TEMPLATE = """
           {% else %}
           <button class="primary-button" type="button" data-open-room-dialog>Start Call</button>
           {% endif %}
-          {% if resume_available %}
+          {% if control_host %}
           <form method="post" action="{{ url_for('admin_use_schedule') }}">
-            <button class="ghost-button" type="submit">Turn Auto On</button>
+            <button
+              class="ghost-button auto-toggle {% if control_host.manual_mode == 'auto' %}is-on{% else %}is-off{% endif %}"
+              type="submit"
+              {% if control_host.manual_mode == 'auto' %}disabled{% endif %}
+            >
+              Auto
+            </button>
           </form>
           {% endif %}
         </div>
@@ -4166,7 +4428,7 @@ ADMIN_TEMPLATE = """
             <span>Agent</span>
             <strong>{% if control_host and control_host.source_online %}Online{% elif control_host %}Offline{% else %}Waiting{% endif %}</strong>
           </div>
-          <div class="metric">
+          <div class="metric is-wide">
             <span>Input</span>
             <strong>{{ control_host.current_device if control_host and control_host.current_device else "Waiting for input" }}</strong>
           </div>
@@ -4186,7 +4448,7 @@ ADMIN_TEMPLATE = """
           {% if control_host %}
           <div class="banner {% if control_host.manual_mode == 'auto' %}ok{% else %}warn{% endif %}">
             {% if control_host.manual_mode == 'auto' %}
-            Auto is on. The saved schedule can start and stop this room.
+            Auto is on. The saved schedule can start or stop this room.
             {% elif control_host.manual_mode == 'force_on' %}
             Auto is off. Manual start is holding {{ control_host.room_alias }} on.
             {% else %}
@@ -4203,7 +4465,29 @@ ADMIN_TEMPLATE = """
         </div>
       </section>
 
-      <section class="panel reports">
+      <section class="panel monitor-panel">
+        <div class="monitor-grid">
+          <div class="monitor-title">
+            <strong>Signal monitor</strong>
+            <span class="monitor-state" id="admin-meter-label">Idle</span>
+          </div>
+          <div class="meter-visual" id="admin-meter-visual">
+            <div class="meter-column" data-admin-meter-column="left">
+              {% for band in ["low", "low", "low", "low", "mid", "mid", "mid", "mid", "mid", "high", "high", "high", "peak", "peak"] %}
+              <span class="meter-segment" data-band="{{ band }}"></span>
+              {% endfor %}
+            </div>
+            <div class="meter-column" data-admin-meter-column="right">
+              {% for band in ["low", "low", "low", "low", "mid", "mid", "mid", "mid", "mid", "high", "high", "high", "peak", "peak"] %}
+              <span class="meter-segment" data-band="{{ band }}"></span>
+              {% endfor %}
+            </div>
+          </div>
+          <audio id="admin-monitor-player" muted playsinline preload="auto" src="{{ admin_stream_url }}"></audio>
+        </div>
+      </section>
+
+      <section class="panel reports" id="reports-panel">
         <div class="view-tabs">
           <button class="view-tab is-active" type="button" data-view-tab="live">Live Conference</button>
           <button class="view-tab" type="button" data-view-tab="history">Past Conferences</button>
@@ -4299,15 +4583,222 @@ ADMIN_TEMPLATE = """
 
       <script>
         (() => {
-          const roomDialog = document.getElementById("room-dialog");
-          if (!roomDialog) {
-            return;
+          const storageKey = "roomcast-control-view";
+          let adminStreamBase = "{{ admin_stream_url }}";
+          const adminAudio = document.getElementById("admin-monitor-player");
+          const adminMeterLabel = document.getElementById("admin-meter-label");
+          const adminMeterColumns = [...document.querySelectorAll("[data-admin-meter-column]")];
+          let adminAudioContext;
+          let adminAnalyser;
+          let adminSourceNode;
+          let adminMeterData;
+          let refreshInFlight = false;
+
+          function canUseMeter() {
+            return true;
           }
-          document.querySelectorAll("[data-open-room-dialog]").forEach((button) => {
-            button.addEventListener("click", () => roomDialog.showModal());
-          });
-          document.querySelectorAll("[data-close-room-dialog]").forEach((button) => {
-            button.addEventListener("click", () => roomDialog.close());
+
+          function paintMeter(columns, percent) {
+            const litSegments = Math.round((Math.max(0, Math.min(100, percent)) / 100) * 14);
+            columns.forEach((column) => {
+              [...column.children].forEach((segment, index) => {
+                segment.classList.toggle("is-on", index < litSegments);
+              });
+            });
+          }
+
+          function connectAdminMeter() {
+            if (!adminAudio || adminSourceNode || !(window.AudioContext || window.webkitAudioContext) || !canUseMeter()) {
+              return;
+            }
+            const Context = window.AudioContext || window.webkitAudioContext;
+            adminAudioContext = adminAudioContext || new Context();
+            adminSourceNode = adminAudioContext.createMediaElementSource(adminAudio);
+            adminAnalyser = adminAudioContext.createAnalyser();
+            adminAnalyser.fftSize = 512;
+            adminAnalyser.smoothingTimeConstant = 0.82;
+            adminMeterData = new Uint8Array(adminAnalyser.frequencyBinCount);
+            adminSourceNode.connect(adminAnalyser);
+
+            window.setInterval(() => {
+              if (!adminAnalyser) {
+                return;
+              }
+              adminAnalyser.getByteFrequencyData(adminMeterData);
+              let peak = 0;
+              for (const value of adminMeterData) {
+                peak = Math.max(peak, value);
+              }
+              const percent = Math.max(0, Math.min(100, Math.round((peak / 255) * 100)));
+              paintMeter(adminMeterColumns, percent);
+              if (percent > 6) {
+                adminMeterLabel.textContent = `${percent}%`;
+              }
+            }, 120);
+          }
+
+          async function startAdminMonitor() {
+            if (!adminAudio) {
+              return;
+            }
+            try {
+              await adminAudio.play();
+              connectAdminMeter();
+              if (adminAudioContext && adminAudioContext.state === "suspended") {
+                await adminAudioContext.resume();
+              }
+            } catch (error) {
+              adminMeterLabel.textContent = "Idle";
+            }
+          }
+
+          function refreshAdminMonitor() {
+            if (!adminAudio) {
+              return;
+            }
+            adminAudio.pause();
+            adminAudio.src = `${adminStreamBase}&v=${Date.now()}`;
+            adminAudio.load();
+            adminMeterLabel.textContent = "Connecting";
+            startAdminMonitor().catch(() => {});
+          }
+
+          function currentDialog() {
+            return document.getElementById("room-dialog");
+          }
+
+          function bindRoomDialogControls() {
+            const roomDialog = currentDialog();
+            document.querySelectorAll("[data-open-room-dialog]").forEach((button) => {
+              button.onclick = () => {
+                if (roomDialog) {
+                  roomDialog.showModal();
+                }
+              };
+            });
+            document.querySelectorAll("[data-close-room-dialog]").forEach((button) => {
+              button.onclick = () => {
+                if (roomDialog) {
+                  roomDialog.close();
+                }
+              };
+            });
+          }
+
+          function activateView(view) {
+            document.querySelectorAll("[data-view-tab]").forEach((tab) => {
+              tab.classList.toggle("is-active", tab.dataset.viewTab === view);
+            });
+            document.querySelectorAll("[data-view-panel]").forEach((panel) => {
+              panel.classList.toggle("is-hidden", panel.dataset.viewPanel !== view);
+            });
+            window.localStorage.setItem(storageKey, view);
+          }
+
+          function bindTabs() {
+            const initialView = window.localStorage.getItem(storageKey) || "live";
+            activateView(initialView);
+            document.querySelectorAll("[data-view-tab]").forEach((tab) => {
+              tab.onclick = () => activateView(tab.dataset.viewTab);
+            });
+          }
+
+          function clearFlashQuery() {
+            const url = new URL(window.location.href);
+            if (!url.searchParams.has("message") && !url.searchParams.has("error")) {
+              return;
+            }
+            window.setTimeout(() => {
+              url.searchParams.delete("message");
+              url.searchParams.delete("error");
+              const next = `${url.pathname}${url.search}${url.hash}`;
+              window.history.replaceState({}, "", next);
+            }, 1400);
+          }
+
+          async function refreshPanel() {
+            const roomDialog = currentDialog();
+            if (refreshInFlight || document.hidden || (roomDialog && roomDialog.open)) {
+              return;
+            }
+            refreshInFlight = true;
+            try {
+              const refreshUrl = new URL(window.location.href);
+              refreshUrl.searchParams.set("_ts", String(Date.now()));
+              const response = await fetch(refreshUrl.toString(), {
+                cache: "no-store",
+                headers: { "X-Requested-With": "roomcast-refresh" },
+              });
+              if (!response.ok) {
+                return;
+              }
+              const html = await response.text();
+              const doc = new DOMParser().parseFromString(html, "text/html");
+              const nextControl = doc.getElementById("control-shell");
+              const nextReports = doc.getElementById("reports-panel");
+              const nextDialog = doc.getElementById("room-dialog");
+              const currentControl = document.getElementById("control-shell");
+              const currentReports = document.getElementById("reports-panel");
+              const currentRoomDialog = currentDialog();
+
+              if (nextControl && currentControl) {
+                const nextStreamUrl = nextControl.dataset.adminStreamUrl || adminStreamBase;
+                currentControl.replaceWith(nextControl);
+                if (nextStreamUrl !== adminStreamBase) {
+                  adminStreamBase = nextStreamUrl;
+                  refreshAdminMonitor();
+                }
+              }
+              if (nextReports && currentReports) {
+                currentReports.replaceWith(nextReports);
+              }
+              if (nextDialog && currentRoomDialog && !currentRoomDialog.open) {
+                currentRoomDialog.innerHTML = nextDialog.innerHTML;
+              }
+
+              bindRoomDialogControls();
+              bindTabs();
+            } catch (error) {
+              /* ignore transient refresh issues */
+            } finally {
+              refreshInFlight = false;
+            }
+          }
+
+          paintMeter(adminMeterColumns, 0);
+          bindRoomDialogControls();
+          bindTabs();
+          clearFlashQuery();
+          if (adminAudio) {
+            adminAudio.addEventListener("playing", () => {
+              adminMeterLabel.textContent = "Live";
+            });
+            adminAudio.addEventListener("waiting", () => {
+              adminMeterLabel.textContent = "Connecting";
+            });
+            adminAudio.addEventListener("ended", () => window.setTimeout(refreshAdminMonitor, 800));
+            adminAudio.addEventListener("error", () => window.setTimeout(refreshAdminMonitor, 800));
+            refreshAdminMonitor();
+          }
+
+          window.setInterval(refreshPanel, 750);
+          window.setInterval(() => {
+            const roomDialog = currentDialog();
+            if (document.hidden || (roomDialog && roomDialog.open)) {
+              return;
+            }
+            if (adminAudio && adminAudio.paused) {
+              refreshAdminMonitor();
+            }
+          }, 750);
+
+          document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) {
+              refreshPanel();
+              if (adminAudio && adminAudio.paused) {
+                refreshAdminMonitor();
+              }
+            }
           });
         })();
       </script>
@@ -4357,7 +4848,7 @@ SETTINGS_TEMPLATE = """
           var(--bg);
       }
       main {
-        max-width: 1040px;
+        max-width: 1120px;
         margin: 0 auto;
         padding: 1rem 1rem 2.5rem;
       }
@@ -4489,7 +4980,11 @@ SETTINGS_TEMPLATE = """
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 0.85rem;
-        margin-bottom: 1rem;
+      }
+      #settings-shell {
+        display: grid;
+        gap: 1rem;
+        margin-top: 1rem;
       }
       .room-tab {
         display: grid;
@@ -4511,7 +5006,7 @@ SETTINGS_TEMPLATE = """
         box-shadow: inset 0 0 0 1px rgba(135, 214, 255, 0.12);
       }
       .workspace {
-        padding: 1rem 1rem 1.15rem;
+        padding: 1.25rem 1.25rem 1.35rem;
       }
       .workspace.is-hidden {
         display: none;
@@ -4552,8 +5047,8 @@ SETTINGS_TEMPLATE = """
       }
       .workspace-grid {
         display: grid;
-        grid-template-columns: minmax(0, 1.12fr) minmax(380px, 460px);
-        gap: 1.15rem;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 1rem;
         align-items: start;
       }
       .workspace-stack {
@@ -4566,8 +5061,9 @@ SETTINGS_TEMPLATE = """
         border: 1px solid var(--line);
         border-radius: 14px;
         background: var(--surface);
-        padding: 1rem;
+        padding: 1.05rem;
         min-width: 0;
+        overflow: hidden;
       }
       .block-head {
         display: flex;
@@ -4576,6 +5072,7 @@ SETTINGS_TEMPLATE = """
         align-items: start;
         margin-bottom: 0.85rem;
         min-width: 0;
+        flex-wrap: wrap;
       }
       .block-head > * {
         min-width: 0;
@@ -4589,6 +5086,7 @@ SETTINGS_TEMPLATE = """
       }
       .block-head p {
         font-size: 0.86rem;
+        overflow-wrap: anywhere;
       }
       .field-note {
         color: var(--muted);
@@ -4666,8 +5164,8 @@ SETTINGS_TEMPLATE = """
       .schedule-head,
       .schedule-row {
         display: grid;
-        grid-template-columns: 5.4rem 5.2rem minmax(8.4rem, 1fr) minmax(8.4rem, 1fr) 6.6rem;
-        gap: 0.7rem;
+        grid-template-columns: 5.25rem 4.9rem minmax(0, 1fr) minmax(0, 1fr) 7.2rem;
+        gap: 0.8rem;
         align-items: stretch;
       }
       .schedule-head {
@@ -4686,7 +5184,8 @@ SETTINGS_TEMPLATE = """
         border-radius: 12px;
         border: 1px solid var(--line);
         background: var(--surface-2);
-        padding: 0.7rem;
+        padding: 0.8rem;
+        overflow: hidden;
       }
       .schedule-cell {
         display: grid;
@@ -4715,9 +5214,9 @@ SETTINGS_TEMPLATE = """
       .save-bar {
         display: flex;
         justify-content: center;
-        padding-top: 0.15rem;
+        padding-top: 0.35rem;
       }
-      @media (max-width: 900px) {
+      @media (max-width: 1120px) {
         .topbar {
           grid-template-columns: 1fr;
           justify-items: start;
@@ -4794,24 +5293,25 @@ SETTINGS_TEMPLATE = """
         {% endif %}
       </section>
 
-      <section class="room-tabs">
-        {% for host in hosts %}
-        <button
-          class="room-tab {% if host.room_slug == selected_room_slug %}is-active{% endif %}"
-          type="button"
-          data-room-tab="{{ host.room_slug }}"
-        >
-          <strong>{{ host.room_alias }}</strong>
-          <span>{{ host.room_label }}</span>
-        </button>
-        {% endfor %}
-      </section>
+      <section id="settings-shell">
+        <section class="room-tabs">
+          {% for host in hosts %}
+          <button
+            class="room-tab {% if host.room_slug == selected_room_slug %}is-active{% endif %}"
+            type="button"
+            data-room-tab="{{ host.room_slug }}"
+          >
+            <strong>{{ host.room_alias }}</strong>
+            <span>{{ host.room_label }}</span>
+          </button>
+          {% endfor %}
+        </section>
 
-      {% for host in hosts %}
-      <section
-        class="panel workspace {% if host.room_slug != selected_room_slug %}is-hidden{% endif %}"
-        data-room-panel="{{ host.room_slug }}"
-      >
+        {% for host in hosts %}
+        <section
+          class="panel workspace {% if host.room_slug != selected_room_slug %}is-hidden{% endif %}"
+          data-room-panel="{{ host.room_slug }}"
+        >
         <form method="post" action="{{ url_for('admin_update_host', slug=host.slug) }}">
           <input type="hidden" name="manual_mode" value="{{ host.manual_mode }}">
           <input type="hidden" name="notes" value="{{ host.notes }}">
@@ -4965,15 +5465,36 @@ SETTINGS_TEMPLATE = """
             <button class="primary-button" type="submit">Save Settings</button>
           </div>
         </form>
+        </section>
+        {% endfor %}
       </section>
-      {% endfor %}
 
       <script>
         (() => {
-          const tabs = [...document.querySelectorAll("[data-room-tab]")];
-          const panels = [...document.querySelectorAll("[data-room-panel]")];
+          const storageKey = "roomcast-settings-room";
+          const shellId = "settings-shell";
+          let dirty = false;
+          let refreshInFlight = false;
 
-          const activateRoom = (roomSlug) => {
+          function selectedRoomSlug() {
+            const activeTab = document.querySelector("[data-room-tab].is-active");
+            return activeTab ? activeTab.dataset.roomTab : "";
+          }
+
+          function syncRoomQuery(roomSlug) {
+            const url = new URL(window.location.href);
+            if (roomSlug) {
+              url.searchParams.set("room", roomSlug);
+            } else {
+              url.searchParams.delete("room");
+            }
+            const next = `${url.pathname}${url.search}${url.hash}`;
+            window.history.replaceState({}, "", next);
+          }
+
+          function activateRoom(roomSlug) {
+            const tabs = [...document.querySelectorAll("[data-room-tab]")];
+            const panels = [...document.querySelectorAll("[data-room-panel]")];
             tabs.forEach((tab) => {
               const active = tab.dataset.roomTab === roomSlug;
               tab.classList.toggle("is-active", active);
@@ -4982,18 +5503,46 @@ SETTINGS_TEMPLATE = """
             panels.forEach((panel) => {
               panel.classList.toggle("is-hidden", panel.dataset.roomPanel !== roomSlug);
             });
-          };
-
-          tabs.forEach((tab) => {
-            tab.addEventListener("click", () => activateRoom(tab.dataset.roomTab));
-          });
-
-          if (tabs.length) {
-            const initialActive = document.querySelector("[data-room-tab].is-active");
-            activateRoom((initialActive || tabs[0]).dataset.roomTab);
+            if (roomSlug) {
+              window.localStorage.setItem(storageKey, roomSlug);
+            }
+            syncRoomQuery(roomSlug);
           }
 
-          document.querySelectorAll("form").forEach((form) => {
+          function markDirty() {
+            dirty = true;
+          }
+
+          function bindTabs() {
+            const tabs = [...document.querySelectorAll("[data-room-tab]")];
+            if (!tabs.length) {
+              return;
+            }
+
+            tabs.forEach((tab) => {
+              tab.onclick = () => activateRoom(tab.dataset.roomTab);
+            });
+
+            const queryRoom = new URL(window.location.href).searchParams.get("room");
+            const remembered = window.localStorage.getItem(storageKey);
+            const activeTab =
+              tabs.find((tab) => tab.dataset.roomTab === queryRoom) ||
+              tabs.find((tab) => tab.dataset.roomTab === remembered) ||
+              document.querySelector("[data-room-tab].is-active") ||
+              tabs[0];
+            activateRoom(activeTab.dataset.roomTab);
+          }
+
+          function bindScheduleForm(form) {
+            form.addEventListener("submit", () => {
+              dirty = false;
+            });
+
+            form.querySelectorAll("input, select, textarea").forEach((field) => {
+              field.addEventListener("input", markDirty);
+              field.addEventListener("change", markDirty);
+            });
+
             const scheduleList = form.querySelector("[data-schedule-list]");
             const template = form.querySelector("[data-schedule-row-template]");
             const addButton = form.querySelector("[data-add-row]");
@@ -5006,7 +5555,8 @@ SETTINGS_TEMPLATE = """
               if (!removeButton) {
                 return;
               }
-              removeButton.addEventListener("click", () => {
+              removeButton.onclick = () => {
+                markDirty();
                 const rows = scheduleList.querySelectorAll("[data-schedule-row]");
                 if (rows.length === 1) {
                   row.querySelector("[name='schedule_enabled']").value = "1";
@@ -5016,17 +5566,89 @@ SETTINGS_TEMPLATE = """
                   return;
                 }
                 row.remove();
-              });
+              };
             };
 
             scheduleList.querySelectorAll("[data-schedule-row]").forEach(bindRow);
 
-            addButton.addEventListener("click", () => {
+            addButton.onclick = () => {
+              markDirty();
               const fragment = template.content.cloneNode(true);
               const row = fragment.querySelector("[data-schedule-row]");
               bindRow(row);
               scheduleList.appendChild(fragment);
-            });
+            };
+          }
+
+          function bindWorkspace() {
+            document.querySelectorAll("form").forEach(bindScheduleForm);
+          }
+
+          function clearFlashQuery() {
+            const url = new URL(window.location.href);
+            if (!url.searchParams.has("message") && !url.searchParams.has("error")) {
+              return;
+            }
+            window.setTimeout(() => {
+              url.searchParams.delete("message");
+              url.searchParams.delete("error");
+              const next = `${url.pathname}${url.search}${url.hash}`;
+              window.history.replaceState({}, "", next);
+            }, 1400);
+          }
+
+          async function refreshSettings() {
+            if (refreshInFlight || dirty || document.hidden) {
+              return;
+            }
+            const activeElement = document.activeElement;
+            if (activeElement && ["INPUT", "SELECT", "TEXTAREA"].includes(activeElement.tagName)) {
+              return;
+            }
+
+            const roomSlug = selectedRoomSlug() || window.localStorage.getItem(storageKey) || "";
+            if (!roomSlug) {
+              return;
+            }
+
+            refreshInFlight = true;
+            try {
+              const refreshUrl = new URL(window.location.href);
+              refreshUrl.searchParams.set("room", roomSlug);
+              refreshUrl.searchParams.set("_ts", String(Date.now()));
+              const response = await fetch(refreshUrl.toString(), {
+                cache: "no-store",
+                headers: { "X-Requested-With": "roomcast-refresh" },
+              });
+              if (!response.ok) {
+                return;
+              }
+              const html = await response.text();
+              const doc = new DOMParser().parseFromString(html, "text/html");
+              const nextShell = doc.getElementById(shellId);
+              const currentShell = document.getElementById(shellId);
+              if (!nextShell || !currentShell) {
+                return;
+              }
+              currentShell.replaceWith(nextShell);
+              bindTabs();
+              bindWorkspace();
+              activateRoom(roomSlug);
+            } catch (error) {
+              /* ignore transient refresh issues */
+            } finally {
+              refreshInFlight = false;
+            }
+          }
+
+          bindTabs();
+          bindWorkspace();
+          clearFlashQuery();
+          window.setInterval(refreshSettings, 750);
+          document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) {
+              refreshSettings();
+            }
           });
         })();
       </script>
