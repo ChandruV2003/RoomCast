@@ -161,7 +161,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         SECRET_KEY=os.getenv("ROOMCAST_SECRET_KEY", "roomcast-dev-secret"),
         ROOMCAST_DB_PATH=os.getenv("ROOMCAST_DB_PATH"),
         ROOMCAST_PUBLIC_NAME=os.getenv("ROOMCAST_PUBLIC_NAME", "NTC Newark WebCall"),
-        ROOMCAST_LISTENER_NAME=os.getenv("ROOMCAST_LISTENER_NAME", "Main Stream Hall"),
+        ROOMCAST_LISTENER_NAME=os.getenv("ROOMCAST_LISTENER_NAME", "NTC Newark WebCall"),
         ROOMCAST_ADMIN_PASSWORD=os.getenv("ROOMCAST_ADMIN_PASSWORD", ""),
         ROOMCAST_TELEPHONY_SECRET=os.getenv("ROOMCAST_TELEPHONY_SECRET", ""),
         ROOMCAST_TWILIO_WEBHOOK_TOKEN=os.getenv("ROOMCAST_TWILIO_WEBHOOK_TOKEN", ""),
@@ -1468,8 +1468,8 @@ LANDING_TEMPLATE = """
       <section class="shell">
         <div class="brand">
           <span class="eyebrow">NTC Newark</span>
-          <h1>{{ listener_name }}</h1>
-          <p>{{ project_name }}</p>
+          <h1>{{ project_name }}</h1>
+          <p>Enter PIN to listen.</p>
         </div>
         {% if message %}
         <div class="banner">{{ message }}</div>
@@ -1514,7 +1514,7 @@ ROOM_TEMPLATE = """
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ listener_name }} · {{ project_name }}</title>
+    <title>{{ project_name }}</title>
     <style>
       :root {
         color-scheme: dark;
@@ -1709,8 +1709,8 @@ ROOM_TEMPLATE = """
       <section class="shell">
         <div class="brand">
           <div class="eyebrow">{{ project_name }}</div>
-          <h1>{{ listener_name }}</h1>
-          <p>Audio opens automatically when the meeting is live.</p>
+          <h1>{{ project_name }}</h1>
+          <p>Open this page once and audio will connect when the call is live.</p>
         </div>
 
         <section class="stack">
@@ -1751,7 +1751,7 @@ ROOM_TEMPLATE = """
               {% endif %}
             </div>
 
-            <audio id="stream-player" playsinline src="{{ stream_url }}"></audio>
+            <audio id="stream-player" playsinline preload="auto" src="{{ stream_url }}"></audio>
           </article>
         </section>
       </section>
@@ -1766,13 +1766,21 @@ ROOM_TEMPLATE = """
       const meterLabel = document.getElementById("meter-label");
       const broadcastChip = document.getElementById("broadcast-chip");
       const small = document.getElementById("small");
+      let roomActive = {{ "true" if room.broadcasting else "false" }};
       let audioContext;
       let analyser;
       let sourceNode;
       let meterData;
 
+      function canUseMeter() {
+        const activation = navigator.userActivation || document.userActivation;
+        return !activation || activation.hasBeenActive;
+      }
+
       function rebuildStreamUrl() {
+        audio.pause();
         audio.src = "{{ stream_url }}" + "?v=" + Date.now();
+        audio.load();
       }
 
       function setChip(element, label, state) {
@@ -1786,7 +1794,7 @@ ROOM_TEMPLATE = """
       }
 
       function connectMeter() {
-        if (sourceNode || !(window.AudioContext || window.webkitAudioContext)) {
+        if (sourceNode || !(window.AudioContext || window.webkitAudioContext) || !canUseMeter()) {
           return;
         }
         const Context = window.AudioContext || window.webkitAudioContext;
@@ -1824,8 +1832,12 @@ ROOM_TEMPLATE = """
           listenButton.hidden = true;
           small.textContent = "Meeting active now.";
         } catch (error) {
-          listenButton.hidden = false;
-          small.textContent = "Tap once if your browser blocks audio.";
+          if (roomActive) {
+            listenButton.hidden = false;
+            small.textContent = "Tap once if your browser blocks audio.";
+          } else {
+            listenButton.hidden = true;
+          }
         }
       }
 
@@ -1841,6 +1853,7 @@ ROOM_TEMPLATE = """
             return;
           }
           const status = await response.json();
+          roomActive = !!status.broadcasting;
           setChip(broadcastChip, status.broadcasting ? "Meeting active now" : "Waiting for meeting", status.broadcasting ? "good" : "warn");
           if (status.broadcasting && audio.paused) {
             refreshAudio();
@@ -1866,16 +1879,28 @@ ROOM_TEMPLATE = """
       listenButton.addEventListener("click", () => {
         refreshAudio();
       });
+      audio.addEventListener("canplay", () => {
+        if (audio.paused) {
+          startPlayback().catch(() => {});
+        }
+      });
       audio.addEventListener("ended", () => setTimeout(refreshAudio, 2500));
       audio.addEventListener("error", () => setTimeout(refreshAudio, 2500));
+      audio.addEventListener("stalled", () => setTimeout(refreshAudio, 1200));
+      audio.addEventListener("waiting", () => {
+        meterLabel.textContent = "Connecting";
+      });
       audio.addEventListener("playing", () => {
         listenButton.hidden = true;
+        meterLabel.textContent = "Live";
       });
 
       rebuildStreamUrl();
-      setInterval(pollStatus, 10000);
+      setInterval(pollStatus, 2500);
       pollStatus();
-      startPlayback().catch(() => {});
+      if (roomActive) {
+        startPlayback().catch(() => {});
+      }
     </script>
   </body>
 </html>
@@ -2588,7 +2613,7 @@ ADMIN_PANEL_TEMPLATE = """
           var(--bg);
       }
       main {
-        max-width: 1040px;
+        max-width: 1160px;
         margin: 0 auto;
         padding: 1rem 1rem 2.5rem;
       }
@@ -3168,7 +3193,7 @@ ADMIN_PANEL_TEMPLATE = """
               {% endif %}
               {% if resume_available %}
               <form method="post" action="{{ url_for('admin_use_schedule') }}">
-                <button class="ghost-button" type="submit">Return to Auto</button>
+                <button class="ghost-button" type="submit">Turn Auto On</button>
               </form>
               {% endif %}
             </div>
@@ -3401,6 +3426,38 @@ ADMIN_PANEL_TEMPLATE = """
             button.addEventListener("click", () => roomDialog.close());
           });
         }
+
+        const storageKey = "roomcast-control-view";
+        const tabs = [...document.querySelectorAll("[data-view-tab]")];
+        const panels = [...document.querySelectorAll("[data-view-panel]")];
+        const activateView = (view) => {
+          tabs.forEach((tab) => {
+            const active = tab.dataset.viewTab === view;
+            tab.classList.toggle("is-active", active);
+          });
+          panels.forEach((panel) => {
+            panel.classList.toggle("is-hidden", panel.dataset.viewPanel !== view);
+          });
+          window.localStorage.setItem(storageKey, view);
+        };
+
+        if (tabs.length && panels.length) {
+          const initialView = window.localStorage.getItem(storageKey) || "live";
+          activateView(initialView);
+          tabs.forEach((tab) => {
+            tab.addEventListener("click", () => activateView(tab.dataset.viewTab));
+          });
+        }
+
+        window.setInterval(() => {
+          if (document.hidden) {
+            return;
+          }
+          if (roomDialog && roomDialog.open) {
+            return;
+          }
+          window.location.reload();
+        }, 5000);
       })();
     </script>
   </body>
@@ -3674,7 +3731,8 @@ ADMIN_TEMPLATE = """
       .secondary-button,
       .ghost-button,
       .close-button,
-      .room-choice {
+      .room-choice,
+      .view-tab {
         appearance: none;
         font: inherit;
         border-radius: 12px;
@@ -3685,7 +3743,8 @@ ADMIN_TEMPLATE = """
       .ghost-button,
       .secondary-button,
       .close-button,
-      .room-choice {
+      .room-choice,
+      .view-tab {
         border: 1px solid var(--line);
         background: var(--surface-2);
         color: var(--text);
@@ -3700,11 +3759,20 @@ ADMIN_TEMPLATE = """
       }
       .primary-button {
         border: 0;
-        padding: 0.84rem 1.4rem;
+        padding: 0.98rem 1.5rem;
         background: #dff4ff;
         color: #081018;
         font-weight: 800;
         cursor: pointer;
+      }
+      .primary-button,
+      .ghost-button,
+      .secondary-button {
+        min-height: 3.2rem;
+        min-width: 11rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
       }
       .secondary-button {
         color: var(--bad);
@@ -3824,9 +3892,32 @@ ADMIN_TEMPLATE = """
         background: var(--good-soft);
         color: var(--good);
       }
+      .banner.warn {
+        background: var(--warn-soft);
+        color: var(--warn);
+      }
       .banner.error {
         background: var(--bad-soft);
         color: var(--bad);
+      }
+      .view-tabs {
+        display: flex;
+        gap: 0.65rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+      }
+      .view-tab {
+        padding: 0.74rem 1rem;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .view-tab.is-active {
+        border-color: rgba(135, 214, 255, 0.42);
+        background: var(--surface-3);
+        color: var(--accent);
+      }
+      .view-panel.is-hidden {
+        display: none;
       }
       .data-grid {
         display: grid;
@@ -4022,7 +4113,7 @@ ADMIN_TEMPLATE = """
         <div class="brand">
           <span class="eyebrow">Control Panel</span>
           <h1>{{ project_name }}</h1>
-          <p>Start or stop the line, then keep an eye on who is listening.</p>
+          <p>Start or stop the line, then watch the live call.</p>
         </div>
         <div class="top-actions">
           <form method="post" action="{{ logout_url }}">
@@ -4061,7 +4152,7 @@ ADMIN_TEMPLATE = """
           {% endif %}
           {% if resume_available %}
           <form method="post" action="{{ url_for('admin_use_schedule') }}">
-            <button class="ghost-button" type="submit">Return to Auto</button>
+            <button class="ghost-button" type="submit">Turn Auto On</button>
           </form>
           {% endif %}
         </div>
@@ -4092,6 +4183,17 @@ ADMIN_TEMPLATE = """
           {% if error %}
           <div class="banner error">{{ error }}</div>
           {% endif %}
+          {% if control_host %}
+          <div class="banner {% if control_host.manual_mode == 'auto' %}ok{% else %}warn{% endif %}">
+            {% if control_host.manual_mode == 'auto' %}
+            Auto is on. The saved schedule can start and stop this room.
+            {% elif control_host.manual_mode == 'force_on' %}
+            Auto is off. Manual start is holding {{ control_host.room_alias }} on.
+            {% else %}
+            Auto is off. Manual stop is holding {{ control_host.room_alias }} off.
+            {% endif %}
+          </div>
+          {% endif %}
           {% for conflict in conflicts %}
           <div class="banner error">{{ conflict }}</div>
           {% endfor %}
@@ -4101,82 +4203,69 @@ ADMIN_TEMPLATE = """
         </div>
       </section>
 
-      <section class="panel data-grid">
-        <article class="block">
-          <div class="section-head">
-            <strong>Current callers</strong>
-            <p>{% if focus_host %}{{ focus_host.room_alias }}{% else %}No room selected{% endif %}</p>
-          </div>
-          {% if current_listeners %}
-          <div class="listener-list">
-            {% for listener in current_listeners %}
-            <div class="listener-item">
-              <strong>{{ listener.participant_label }}</strong>
-              <div class="listener-meta">{{ listener.location_label or "Location unavailable" }} · {{ listener.channel }}</div>
-              <div class="listener-meta">Joined {{ listener.joined_label }}</div>
-            </div>
-            {% endfor %}
-          </div>
-          {% else %}
-          <p class="empty-state">Nobody is connected right now.</p>
-          {% endif %}
-        </article>
-
-        <article class="block">
-          <div class="section-head">
-            <strong>Recent callers</strong>
-            <p>Latest activity</p>
-          </div>
-          {% if recent_listeners %}
-          <div class="listener-list">
-            {% for listener in recent_listeners %}
-            <div class="listener-item">
-              <strong>{{ listener.participant_label }}</strong>
-              <div class="listener-meta">{{ listener.location_label or "Location unavailable" }} · {{ listener.channel }}</div>
-              <div class="listener-meta">Joined {{ listener.joined_label }}{% if listener.left_at %} · Left {{ listener.left_label }}{% endif %}</div>
-            </div>
-            {% endfor %}
-          </div>
-          {% else %}
-          <p class="empty-state">No recent listener activity yet.</p>
-          {% endif %}
-        </article>
-      </section>
-
       <section class="panel reports">
-        <div class="section-head">
-          <strong>Past calls</strong>
-          <p>Download CSV reports</p>
+        <div class="view-tabs">
+          <button class="view-tab is-active" type="button" data-view-tab="live">Live Conference</button>
+          <button class="view-tab" type="button" data-view-tab="history">Past Conferences</button>
         </div>
-        <div class="table-wrap">
-          <table class="history-table">
-            <thead>
-              <tr>
-                <th>Room</th>
-                <th>Started</th>
-                <th>Duration</th>
-                <th>Listeners</th>
-                <th>Incidents</th>
-                <th>Report</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for meeting in call_history %}
-              <tr>
-                <td>{{ meeting.room_alias }}</td>
-                <td>{{ meeting.started_label }}</td>
-                <td>{{ meeting.duration_text }}</td>
-                <td>{{ meeting.listener_count }}</td>
-                <td>{{ meeting.incident_count }}</td>
-                <td><a class="history-link" href="{{ url_for('admin_report_download', meeting_id=meeting.id) }}">Download</a></td>
-              </tr>
-              {% else %}
-              <tr>
-                <td colspan="6">No past calls yet.</td>
-              </tr>
+
+        <div class="view-panel" data-view-panel="live">
+          <article class="block">
+            <div class="section-head">
+              <strong>Current callers</strong>
+              <p>{% if focus_host %}{{ focus_host.room_alias }}{% else %}No room selected{% endif %}</p>
+            </div>
+            {% if current_listeners %}
+            <div class="listener-list">
+              {% for listener in current_listeners %}
+              <div class="listener-item">
+                <strong>{{ listener.participant_label }}</strong>
+                <div class="listener-meta">{{ listener.location_label or "Location unavailable" }} · {{ listener.channel }}</div>
+                <div class="listener-meta">Joined {{ listener.joined_label }}</div>
+              </div>
               {% endfor %}
-            </tbody>
-          </table>
+            </div>
+            {% else %}
+            <p class="empty-state">Nobody is connected right now.</p>
+            {% endif %}
+          </article>
+        </div>
+
+        <div class="view-panel is-hidden" data-view-panel="history">
+          <div class="section-head">
+            <strong>Past conferences</strong>
+            <p>Meeting stats and report downloads</p>
+          </div>
+          <div class="table-wrap">
+            <table class="history-table">
+              <thead>
+                <tr>
+                  <th>Room</th>
+                  <th>Started</th>
+                  <th>Duration</th>
+                  <th>Listeners</th>
+                  <th>Incidents</th>
+                  <th>Report</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for meeting in call_history %}
+                <tr>
+                  <td>{{ meeting.room_alias }}</td>
+                  <td>{{ meeting.started_label }}</td>
+                  <td>{{ meeting.duration_text }}</td>
+                  <td>{{ meeting.listener_count }}</td>
+                  <td>{{ meeting.incident_count }}</td>
+                  <td><a class="history-link" href="{{ url_for('admin_report_download', meeting_id=meeting.id) }}">Download</a></td>
+                </tr>
+                {% else %}
+                <tr>
+                  <td colspan="6">No past calls yet.</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 
@@ -4463,13 +4552,14 @@ SETTINGS_TEMPLATE = """
       }
       .workspace-grid {
         display: grid;
-        grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+        grid-template-columns: minmax(0, 1.12fr) minmax(380px, 460px);
         gap: 1.15rem;
         align-items: start;
       }
       .workspace-stack {
         display: grid;
         gap: 1rem;
+        min-width: 0;
       }
       .block,
       .sidebar-note {
@@ -4477,6 +4567,7 @@ SETTINGS_TEMPLATE = """
         border-radius: 14px;
         background: var(--surface);
         padding: 1rem;
+        min-width: 0;
       }
       .block-head {
         display: flex;
@@ -4484,6 +4575,10 @@ SETTINGS_TEMPLATE = """
         gap: 0.8rem;
         align-items: start;
         margin-bottom: 0.85rem;
+        min-width: 0;
+      }
+      .block-head > * {
+        min-width: 0;
       }
       .block-head strong {
         font-size: 0.78rem;
@@ -4510,6 +4605,8 @@ SETTINGS_TEMPLATE = """
         display: flex;
         gap: 0.45rem;
         flex-wrap: wrap;
+        min-width: 0;
+        max-width: 100%;
       }
       .device-chip {
         display: inline-flex;
@@ -4522,6 +4619,11 @@ SETTINGS_TEMPLATE = """
         font-size: 0.8rem;
         font-weight: 600;
         font-family: var(--mono);
+        max-width: 100%;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       input[type="time"],
       select {
@@ -4537,15 +4639,16 @@ SETTINGS_TEMPLATE = """
       .order-list {
         display: grid;
         gap: 0.7rem;
+        min-width: 0;
       }
       .order-row {
         display: grid;
-        grid-template-columns: 6.4rem minmax(0, 1fr);
-        align-items: center;
+        grid-template-columns: 1fr;
+        align-items: start;
         gap: 0.75rem;
+        min-width: 0;
       }
       .order-row span {
-        min-width: 6.5rem;
         color: var(--muted);
         font-size: 0.74rem;
         text-transform: uppercase;
@@ -4553,16 +4656,17 @@ SETTINGS_TEMPLATE = """
         font-family: var(--mono);
       }
       .order-row select {
-        flex: 1;
+        width: 100%;
       }
       .schedule-shell {
         display: grid;
         gap: 0.9rem;
+        min-width: 0;
       }
       .schedule-head,
       .schedule-row {
         display: grid;
-        grid-template-columns: 5.4rem 4.75rem minmax(8rem, 1fr) minmax(8rem, 1fr) auto;
+        grid-template-columns: 5.4rem 5.2rem minmax(8.4rem, 1fr) minmax(8.4rem, 1fr) 6.6rem;
         gap: 0.7rem;
         align-items: stretch;
       }
@@ -4590,7 +4694,8 @@ SETTINGS_TEMPLATE = """
       }
       .row-button {
         align-self: stretch;
-        min-width: 5.75rem;
+        min-width: 0;
+        width: 100%;
       }
       .schedule-cell span {
         display: none;
@@ -4850,11 +4955,8 @@ SETTINGS_TEMPLATE = """
                     </select>
                   </label>
                   {% endfor %}
+                  <p class="field-note">The device list comes from the laptop agent. If a new input appears, place it in the order you want and save once.</p>
                 </div>
-              </section>
-
-              <section class="sidebar-note">
-                <p class="field-note">The device list comes from the laptop agent. If a new input appears, place it in the order you want and save once.</p>
               </section>
             </div>
           </div>

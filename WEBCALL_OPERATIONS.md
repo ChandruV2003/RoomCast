@@ -17,7 +17,7 @@
 - Press `Start Call` to bring that room live
 - Press `Stop Call` to take the room down
 - Use `Settings` for input order and schedule entries
-- Use `Return to Auto` from the control panel only if a room was manually held on or off and you want it following the saved schedule again
+- Use `Turn Auto On` from the control panel only if a room was manually held on or off and you want it following the saved schedule again
 
 The admin panel is only a monitor/control surface. Closing the browser does not stop the service.
 

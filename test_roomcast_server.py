@@ -38,13 +38,13 @@ class RoomCastServerTests(unittest.TestCase):
             follow_redirects=True,
         )
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Main Stream Hall", response.data)
+        self.assertIn(b"NTC Newark WebCall", response.data)
         self.assertIn(b"stream-player", response.data)
 
     def test_public_page_hides_admin_link(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Main Stream Hall", response.data)
+        self.assertIn(b"NTC Newark WebCall", response.data)
         self.assertIn(b"Enter PIN", response.data)
         self.assertNotIn(b"Volunteer / Admin", response.data)
 
@@ -56,14 +56,14 @@ class RoomCastServerTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"stream-player", response.data)
-        self.assertIn(b"Main Stream Hall", response.data)
+        self.assertIn(b"NTC Newark WebCall", response.data)
         self.assertNotIn(b"Enter PIN", response.data)
 
     def test_direct_pin_route_redirects_into_room(self):
         response = self.client.get("/p/7070", follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"stream-player", response.data)
-        self.assertIn(b"Main Stream Hall", response.data)
+        self.assertIn(b"NTC Newark WebCall", response.data)
 
     def test_live_status_requires_pin_authorization(self):
         response = self.client.get("/api/live/status")
@@ -89,6 +89,9 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertNotIn(b"Diagnostics", response.data)
         self.assertNotIn(b"Use Schedule", response.data)
         self.assertNotIn(b"Overview", response.data)
+        self.assertIn(b"Live Conference", response.data)
+        self.assertIn(b"Past Conferences", response.data)
+        self.assertNotIn(b"Recent callers", response.data)
 
     def test_admin_schedule_update_persists(self):
         self.client.post(
