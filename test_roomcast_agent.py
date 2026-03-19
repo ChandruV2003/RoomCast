@@ -74,6 +74,31 @@ class RoomCastAgentTests(unittest.TestCase):
         self.assertEqual(agent.restart_not_before, 0.0)
         self.assertEqual(agent.last_error, "")
 
+    def test_stereo_pair_devices_keep_stereo_channels(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Analogue 1 + 2 (3- Focusrite USB Audio)",
+        )
+
+        self.assertIn("-ac", command)
+        self.assertEqual(command[command.index("-ac") + 1], "2")
+        self.assertEqual(command[command.index("-b:a") + 1], "192k")
+
+    def test_microphone_devices_stay_mono(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Microphone (Scarlett Solo 4th Gen)",
+        )
+
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertEqual(command[command.index("-b:a") + 1], "128k")
+
 
 if __name__ == "__main__":
     unittest.main()

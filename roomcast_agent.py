@@ -180,6 +180,20 @@ class RoomCastAgent:
                     ordered.append(text)
         return ordered
 
+    @staticmethod
+    def _channel_profile(device_name: str | None):
+        name = (device_name or "").casefold()
+        stereo_markers = (
+            "analogue 1 + 2",
+            "analog 1 + 2",
+            "stereo mix",
+            "line 1 + 2",
+            "line in",
+        )
+        if any(marker in name for marker in stereo_markers):
+            return 2, "192k"
+        return 1, "128k"
+
     def choose_device(self, server_device_order=None, server_preferred: str | None = None, server_fallback: str | None = None):
         if self.test_tone:
             return "test-tone"
@@ -217,6 +231,7 @@ class RoomCastAgent:
         return response.json()
 
     def _build_ffmpeg_command(self, ingest_url: str, device_name: str):
+        channels, bitrate = self._channel_profile(device_name)
         command = [
             self.ffmpeg_path,
             "-hide_banner",
@@ -251,11 +266,11 @@ class RoomCastAgent:
         command.extend(
             [
                 "-ac",
-                "1",
+                str(channels),
                 "-ar",
                 "48000",
                 "-b:a",
-                "128k",
+                bitrate,
                 "-content_type",
                 "audio/mpeg",
                 "-f",
