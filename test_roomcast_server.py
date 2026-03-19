@@ -1,4 +1,5 @@
 import os
+import queue
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from werkzeug.datastructures import MultiDict
 
 os.environ["ROOMCAST_DEFAULT_PIN"] = "7070"
 
-from roomcast_server import create_app
+from roomcast_server import LISTENER_QUEUE_MAXSIZE, RoomStreamHub, create_app
 
 
 class RoomCastServerTests(unittest.TestCase):
@@ -199,6 +200,35 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertEqual(response.mimetype, "text/csv")
         self.assertIn(b"Meeting,Tarry Meeting Hall", response.data)
         self.assertIn(b"Web 127.0.0.1", response.data)
+
+    def test_stream_hub_uses_small_listener_queue(self):
+        hub = RoomStreamHub()
+        room = hub._get_room("meeting-hall")
+        queue_obj = queue.Queue(maxsize=LISTENER_QUEUE_MAXSIZE)
+        room.listeners[1] = queue_obj
+        self.assertEqual(queue_obj.maxsize, LISTENER_QUEUE_MAXSIZE)
+
+    def test_stream_hub_drops_backlog_when_listener_falls_behind(self):
+        hub = RoomStreamHub()
+        room = hub._get_room("meeting-hall")
+        listener = queue.Queue(maxsize=LISTENER_QUEUE_MAXSIZE)
+        room.listeners[1] = listener
+
+        for index in range(LISTENER_QUEUE_MAXSIZE + 3):
+            hub.publish("meeting-hall", str(index).encode("utf-8"))
+
+        queued = []
+        while not listener.empty():
+            queued.append(listener.get_nowait())
+
+        self.assertEqual(
+            queued,
+            [
+                str(LISTENER_QUEUE_MAXSIZE).encode("utf-8"),
+                str(LISTENER_QUEUE_MAXSIZE + 1).encode("utf-8"),
+                str(LISTENER_QUEUE_MAXSIZE + 2).encode("utf-8"),
+            ],
+        )
 
 
 if __name__ == "__main__":

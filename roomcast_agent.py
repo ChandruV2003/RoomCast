@@ -181,18 +181,36 @@ class RoomCastAgent:
         return ordered
 
     @staticmethod
-    def _channel_profile(device_name: str | None):
+    def _audio_profile(device_name: str | None):
         name = (device_name or "").casefold()
-        stereo_markers = (
+        silence_filter = None
+        if "stereo mix" in name:
+            return {
+                "channels": 2,
+                "bitrate": "192k",
+                "filter_prefix": [],
+            }
+
+        # Focusrite line pairs are showing up as stereo devices even though the room feed
+        # is arriving as a single mono program on the left channel. Preserve that channel
+        # directly instead of averaging it with the effectively-dead right side.
+        left_channel_markers = (
             "analogue 1 + 2",
             "analog 1 + 2",
-            "stereo mix",
             "line 1 + 2",
-            "line in",
         )
-        if any(marker in name for marker in stereo_markers):
-            return 2, "192k"
-        return 1, "128k"
+        if any(marker in name for marker in left_channel_markers):
+            return {
+                "channels": 1,
+                "bitrate": "128k",
+                "filter_prefix": ["pan=mono|c0=c0"],
+            }
+
+        return {
+            "channels": 1,
+            "bitrate": "128k",
+            "filter_prefix": [],
+        }
 
     def choose_device(self, server_device_order=None, server_preferred: str | None = None, server_fallback: str | None = None):
         if self.test_tone:
@@ -231,7 +249,7 @@ class RoomCastAgent:
         return response.json()
 
     def _build_ffmpeg_command(self, ingest_url: str, device_name: str):
-        channels, bitrate = self._channel_profile(device_name)
+        profile = self._audio_profile(device_name)
         command = [
             self.ffmpeg_path,
             "-hide_banner",
@@ -250,6 +268,8 @@ class RoomCastAgent:
                 ]
             )
         else:
+            filter_chain = list(profile["filter_prefix"])
+            filter_chain.append(f"silencedetect=noise={self.silence_noise_threshold}:d={self.silence_timeout_seconds}")
             command.extend(
                 [
                     "-f",
@@ -259,18 +279,18 @@ class RoomCastAgent:
                     "-i",
                     f"audio={device_name}",
                     "-af",
-                    f"silencedetect=noise={self.silence_noise_threshold}:d={self.silence_timeout_seconds}",
+                    ",".join(filter_chain),
                 ]
             )
 
         command.extend(
             [
                 "-ac",
-                str(channels),
+                str(profile["channels"]),
                 "-ar",
                 "48000",
                 "-b:a",
-                bitrate,
+                profile["bitrate"],
                 "-content_type",
                 "audio/mpeg",
                 "-f",

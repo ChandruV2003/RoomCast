@@ -25,6 +25,10 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from roomcast_store import RoomCastStore
 
 
+LISTENER_QUEUE_MAXSIZE = 8
+INGEST_CHUNK_SIZE = 4096
+
+
 STATUS_TTL_SECONDS = 45
 ROOM_ALIASES = {
     "study-room": "Room A",
@@ -87,10 +91,11 @@ class RoomStreamHub:
             try:
                 listener.put_nowait(chunk)
             except queue.Full:
-                try:
-                    listener.get_nowait()
-                except queue.Empty:
-                    pass
+                while True:
+                    try:
+                        listener.get_nowait()
+                    except queue.Empty:
+                        break
                 try:
                     listener.put_nowait(chunk)
                 except queue.Full:
@@ -113,7 +118,7 @@ class RoomStreamHub:
                 continue
 
     def listen(self, room_slug: str):
-        listener = queue.Queue(maxsize=64)
+        listener = queue.Queue(maxsize=LISTENER_QUEUE_MAXSIZE)
         listener_id = id(listener)
 
         with self._lock:
@@ -1261,7 +1266,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         stream_hub.start_broadcast(room_slug, host_slug)
         try:
             while True:
-                chunk = request.stream.read(16384)
+                chunk = request.stream.read(INGEST_CHUNK_SIZE)
                 if not chunk:
                     break
                 stream_hub.publish(room_slug, chunk)

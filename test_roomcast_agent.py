@@ -74,7 +74,7 @@ class RoomCastAgentTests(unittest.TestCase):
         self.assertEqual(agent.restart_not_before, 0.0)
         self.assertEqual(agent.last_error, "")
 
-    def test_stereo_pair_devices_keep_stereo_channels(self):
+    def test_analogue_pair_devices_use_left_channel_mono(self):
         agent = self._make_agent()
         agent.test_tone = False
 
@@ -84,8 +84,13 @@ class RoomCastAgentTests(unittest.TestCase):
         )
 
         self.assertIn("-ac", command)
-        self.assertEqual(command[command.index("-ac") + 1], "2")
-        self.assertEqual(command[command.index("-b:a") + 1], "192k")
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertEqual(command[command.index("-b:a") + 1], "128k")
+        self.assertIn("-af", command)
+        self.assertEqual(
+            command[command.index("-af") + 1],
+            "pan=mono|c0=c0,silencedetect=noise=-45dB:d=45",
+        )
 
     def test_microphone_devices_stay_mono(self):
         agent = self._make_agent()
@@ -98,6 +103,18 @@ class RoomCastAgentTests(unittest.TestCase):
 
         self.assertEqual(command[command.index("-ac") + 1], "1")
         self.assertEqual(command[command.index("-b:a") + 1], "128k")
+
+    def test_stereo_mix_devices_keep_stereo(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Stereo Mix (Realtek(R) Audio)",
+        )
+
+        self.assertEqual(command[command.index("-ac") + 1], "2")
+        self.assertEqual(command[command.index("-b:a") + 1], "192k")
 
 
 if __name__ == "__main__":
