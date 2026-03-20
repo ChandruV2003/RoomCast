@@ -13,6 +13,7 @@ import secrets
 import time
 import csv
 import io
+import struct
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,17 @@ LIVE_SNAPSHOT_POLL_SECONDS = 0.2
 
 
 STATUS_TTL_SECONDS = 45
+STREAM_PROFILES = {
+    "mp3": {
+        "mimetype": "audio/mpeg",
+    },
+    "wav_pcm24": {
+        "mimetype": "audio/wav",
+        "channels": 1,
+        "sample_rate_hz": 48000,
+        "bits_per_sample": 24,
+    },
+}
 ROOM_ALIASES = {
     "study-room": "Room A",
     "meeting-hall": "Room B",
@@ -49,6 +61,28 @@ def _parse_iso8601(value: str | None):
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _wav_stream_header(*, channels: int, sample_rate_hz: int, bits_per_sample: int) -> bytes:
+    block_align = channels * (bits_per_sample // 8)
+    byte_rate = sample_rate_hz * block_align
+    placeholder_size = 0xFFFFFFFF
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        placeholder_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate_hz,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        placeholder_size,
+    )
 
 
 @dataclass
@@ -172,6 +206,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_DB_PATH=os.getenv("ROOMCAST_DB_PATH"),
         ROOMCAST_PUBLIC_NAME=os.getenv("ROOMCAST_PUBLIC_NAME", "NTC Newark WebCall"),
         ROOMCAST_LISTENER_NAME=os.getenv("ROOMCAST_LISTENER_NAME", "NTC Newark WebCall"),
+        ROOMCAST_STREAM_PROFILE=os.getenv("ROOMCAST_STREAM_PROFILE", "mp3"),
         ROOMCAST_ADMIN_PASSWORD=os.getenv("ROOMCAST_ADMIN_PASSWORD", ""),
         ROOMCAST_TELEPHONY_SECRET=os.getenv("ROOMCAST_TELEPHONY_SECRET", ""),
         ROOMCAST_TWILIO_WEBHOOK_TOKEN=os.getenv("ROOMCAST_TWILIO_WEBHOOK_TOKEN", ""),
@@ -195,6 +230,13 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     def _listener_name() -> str:
         return app.config["ROOMCAST_LISTENER_NAME"]
+
+    def _stream_profile_name() -> str:
+        configured = (app.config.get("ROOMCAST_STREAM_PROFILE") or "mp3").strip().lower()
+        return configured if configured in STREAM_PROFILES else "mp3"
+
+    def _stream_profile():
+        return STREAM_PROFILES[_stream_profile_name()]
 
     def _display_timezone() -> ZoneInfo:
         return ZoneInfo("America/New_York")
@@ -1111,6 +1153,25 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         response.headers["Content-Disposition"] = f'attachment; filename="webcall-report-{meeting_id}.csv"'
         return response
 
+    def _audio_stream_response(stream_factory):
+        stream_profile = _stream_profile()
+
+        def _stream():
+            if _stream_profile_name() == "wav_pcm24":
+                yield _wav_stream_header(
+                    channels=stream_profile["channels"],
+                    sample_rate_hz=stream_profile["sample_rate_hz"],
+                    bits_per_sample=stream_profile["bits_per_sample"],
+                )
+            yield from stream_factory()
+
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return Response(_stream(), mimetype=stream_profile["mimetype"], headers=headers)
+
     @app.get("/listen/<room_slug>.mp3")
     def listen(room_slug: str):
         room = roomcast_store.get_room(room_slug)
@@ -1135,13 +1196,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 yield from stream_hub.listen(room_slug)
             finally:
                 roomcast_store.end_listener_session(listener_session_id)
-
-        headers = {
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-        return Response(_stream(), mimetype="audio/mpeg", headers=headers)
+        return _audio_stream_response(_stream)
 
     @app.get("/listen/live.mp3")
     def listen_live():
@@ -1157,12 +1212,11 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         )
         snapshot = _await_snapshot(snapshot_resolver)
         if not snapshot:
-            headers = {
+            return Response(b"", mimetype=_stream_profile()["mimetype"], headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate",
                 "Pragma": "no-cache",
                 "X-Accel-Buffering": "no",
-            }
-            return Response(b"", mimetype="audio/mpeg", headers=headers)
+            })
 
         room_slug = snapshot["slug"]
         participant_label = session.get("listener_name") or f"Web {request.headers.get('X-Forwarded-For', request.remote_addr or 'listener')}"
@@ -1184,13 +1238,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             finally:
                 if listener_session_id is not None:
                     roomcast_store.end_listener_session(listener_session_id)
-
-        headers = {
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-        return Response(_stream(), mimetype="audio/mpeg", headers=headers)
+        return _audio_stream_response(_stream)
 
     @app.get("/telephony/stream/<room_slug>.mp3")
     def telephony_stream(room_slug: str):
@@ -1220,13 +1268,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 yield from stream_hub.listen(room_slug)
             finally:
                 roomcast_store.end_listener_session(listener_session_id)
-
-        headers = {
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-        return Response(_stream(), mimetype="audio/mpeg", headers=headers)
+        return _audio_stream_response(_stream)
 
     @app.route("/telephony/twilio/<webhook_token>/voice", methods=["GET", "POST"])
     def twilio_voice(webhook_token: str):
@@ -1302,6 +1344,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 "device_order": refreshed["device_order"],
                 "preferred_audio_pattern": refreshed["preferred_audio_pattern"],
                 "fallback_audio_pattern": refreshed["fallback_audio_pattern"],
+                "stream_profile": _stream_profile_name(),
                 "ingest_url": url_for(
                     "source_ingest",
                     host_slug=host_slug,

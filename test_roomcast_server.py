@@ -148,6 +148,23 @@ class RoomCastServerTests(unittest.TestCase):
         payload = response.get_json()
         self.assertIn("/api/source/ingest/hp-pavilion-14m-ba1xx", payload["ingest_url"])
         self.assertIn("device_order", payload)
+        self.assertEqual(payload["stream_profile"], "mp3")
+
+    def test_listen_live_uses_wav_mimetype_when_configured(self):
+        app = create_app(
+            {
+                "TESTING": True,
+                "ROOMCAST_DB_PATH": str(Path(self.tempdir.name) / "wav-roomcast.db"),
+                "SECRET_KEY": "test-secret",
+                "SESSION_COOKIE_SECURE": False,
+                "ROOMCAST_STREAM_PROFILE": "wav_pcm24",
+            }
+        )
+        client = app.test_client()
+        client.get("/p/7070", follow_redirects=True)
+        response = client.get("/listen/live.mp3")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "audio/wav")
 
     def test_listen_requires_pin_authorization(self):
         response = self.client.get("/listen/meeting-hall.mp3")

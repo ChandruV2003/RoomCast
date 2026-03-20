@@ -36,7 +36,7 @@ class RoomCastAgent:
         token: str,
         *,
         ffmpeg_path: str | None = None,
-        poll_interval: int = 15,
+        poll_interval: int = 1,
         device_order=None,
         preferred_audio_pattern: str | None = None,
         fallback_audio_pattern: str | None = None,
@@ -75,6 +75,7 @@ class RoomCastAgent:
         self.desired_active = False
         self.silence_triggered = False
         self.restart_not_before = 0.0
+        self.stream_profile = "mp3"
 
     def _silence_warning_message(self) -> str:
         return (
@@ -181,15 +182,20 @@ class RoomCastAgent:
         return ordered
 
     @staticmethod
-    def _audio_profile(device_name: str | None):
+    def _audio_profile(device_name: str | None, stream_profile: str = "mp3"):
         name = (device_name or "").casefold()
-        silence_filter = None
+        normalize_to_mono = stream_profile == "wav_pcm24"
         if "stereo mix" in name:
-            return {
+            profile = {
                 "channels": 2,
                 "bitrate": "192k",
                 "filter_prefix": [],
             }
+            if normalize_to_mono:
+                profile["channels"] = 1
+                profile["bitrate"] = ""
+                profile["filter_prefix"] = ["pan=mono|c0=.5*c0+.5*c1"]
+            return profile
 
         # Focusrite line pairs are showing up as stereo devices even though the room feed
         # is arriving as a single mono program on the left channel. Preserve that channel
@@ -232,6 +238,7 @@ class RoomCastAgent:
         return devices[0] if devices else None
 
     def send_heartbeat(self):
+        stream_preview = self._audio_profile(self.current_device or None, self.stream_profile)
         payload = {
             "host_slug": self.host_slug,
             "token": self.token,
@@ -239,6 +246,10 @@ class RoomCastAgent:
             "current_device": self.current_device,
             "is_ingesting": self._process_is_running(),
             "last_error": self.last_error,
+            "stream_profile": self.stream_profile,
+            "stream_channels": stream_preview["channels"],
+            "sample_rate_hz": 48000,
+            "sample_bits": 24 if self.stream_profile == "wav_pcm24" else 0,
         }
         response = requests.post(
             f"{self.server_url}/api/source/heartbeat",
@@ -248,14 +259,19 @@ class RoomCastAgent:
         response.raise_for_status()
         return response.json()
 
-    def _build_ffmpeg_command(self, ingest_url: str, device_name: str):
-        profile = self._audio_profile(device_name)
+    def _build_ffmpeg_command(self, ingest_url: str, device_name: str, stream_profile: str | None = None):
+        active_stream_profile = (stream_profile or self.stream_profile or "mp3").strip().lower() or "mp3"
+        profile = self._audio_profile(device_name, active_stream_profile)
         command = [
             self.ffmpeg_path,
             "-hide_banner",
             "-nostdin",
             "-loglevel",
             "info",
+            "-fflags",
+            "+nobuffer",
+            "-flags",
+            "low_delay",
         ]
 
         if self.test_tone:
@@ -275,7 +291,7 @@ class RoomCastAgent:
                     "-f",
                     "dshow",
                     "-audio_buffer_size",
-                    "50",
+                    "20",
                     "-i",
                     f"audio={device_name}",
                     "-af",
@@ -289,8 +305,32 @@ class RoomCastAgent:
                 str(profile["channels"]),
                 "-ar",
                 "48000",
+            ]
+        )
+        if active_stream_profile == "wav_pcm24":
+            command.extend(
+                [
+                    "-c:a",
+                    "pcm_s24le",
+                    "-f",
+                    "s24le",
+                    "-content_type",
+                    "application/octet-stream",
+                    "-method",
+                    "POST",
+                    ingest_url,
+                ]
+            )
+            return command
+
+        command.extend(
+            [
                 "-b:a",
                 profile["bitrate"],
+                "-flush_packets",
+                "1",
+                "-write_xing",
+                "0",
                 "-content_type",
                 "audio/mpeg",
                 "-f",
@@ -325,7 +365,7 @@ class RoomCastAgent:
 
         self.current_device = device_name
         self.silence_triggered = False
-        command = self._build_ffmpeg_command(ingest_url, device_name)
+        command = self._build_ffmpeg_command(ingest_url, device_name, self.stream_profile)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         if self._ffmpeg_log_handle:
             self._ffmpeg_log_handle.close()
@@ -396,6 +436,7 @@ class RoomCastAgent:
                     self.cached_devices = self.list_audio_devices()
                 reply = self.send_heartbeat()
                 self.desired_active = bool(reply.get("desired_active"))
+                self.stream_profile = (reply.get("stream_profile") or self.stream_profile or "mp3").strip().lower() or "mp3"
                 if self.last_error != self._silence_warning_message():
                     self.last_error = ""
 
@@ -443,7 +484,7 @@ def main():
     parser.add_argument("--host-slug", required=True, help="Host slug registered on the RoomCast server")
     parser.add_argument("--token", required=True, help="Heartbeat token for this source host")
     parser.add_argument("--ffmpeg-path", help="Explicit path to ffmpeg")
-    parser.add_argument("--poll-interval", type=int, default=15, help="Seconds between heartbeat polls")
+    parser.add_argument("--poll-interval", type=int, default=1, help="Seconds between heartbeat polls")
     parser.add_argument(
         "--device-order",
         action="append",

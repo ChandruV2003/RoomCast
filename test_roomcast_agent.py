@@ -116,6 +116,25 @@ class RoomCastAgentTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ac") + 1], "2")
         self.assertEqual(command[command.index("-b:a") + 1], "192k")
 
+    def test_wav_pcm24_profile_uses_raw_pcm_transport(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Analogue 1 + 2 (3- Focusrite USB Audio)",
+            "wav_pcm24",
+        )
+
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertIn("-c:a", command)
+        self.assertEqual(command[command.index("-c:a") + 1], "pcm_s24le")
+        self.assertIn("-f", command)
+        self.assertEqual(command[command.index("-f", command.index("-c:a")) + 1], "s24le")
+        self.assertIn("-content_type", command)
+        self.assertEqual(command[command.index("-content_type") + 1], "application/octet-stream")
+        self.assertEqual(command[command.index("-method") + 1], "POST")
+
 
 if __name__ == "__main__":
     unittest.main()
