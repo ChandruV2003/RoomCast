@@ -1746,21 +1746,11 @@ ROOM_TEMPLATE = """
         border: 1px solid var(--line);
         background: var(--surface-2);
         padding: 1rem;
+        transition: border-color 120ms linear, box-shadow 120ms linear;
       }
-      .listen-button {
-        appearance: none;
-        border: 0;
-        border-radius: 12px;
-        padding: 0.84rem 1.2rem;
-        background: #dff4ff;
-        color: #081018;
-        font: inherit;
-        font-weight: 800;
-        cursor: pointer;
-        width: 100%;
-      }
-      .listen-button[hidden] {
-        display: none;
+      .player-shell.awaiting-gesture {
+        border-color: rgba(135, 214, 255, 0.36);
+        box-shadow: 0 0 0 1px rgba(135, 214, 255, 0.12) inset;
       }
       .meter {
         display: grid;
@@ -1866,8 +1856,6 @@ ROOM_TEMPLATE = """
             </div>
 
             <div class="player-shell">
-              <button type="button" class="listen-button" id="listen-button" hidden>Start Audio</button>
-
               <div class="meter">
                 <div class="meter-head">
                   <span>Signal level</span>
@@ -1914,7 +1902,7 @@ ROOM_TEMPLATE = """
 
     <script>
       const audio = document.getElementById("stream-player");
-      const listenButton = document.getElementById("listen-button");
+      const playerShell = document.querySelector(".player-shell");
       const volumeSlider = document.getElementById("volume-slider");
       const volumeValue = document.getElementById("volume-value");
       const meterColumns = [...document.querySelectorAll("[data-meter-column]")];
@@ -1929,6 +1917,7 @@ ROOM_TEMPLATE = """
       let meterData;
       let meterPeakPercent = 0;
       let meterPeakExpiresAt = 0;
+      let autoplayBlocked = false;
 
       function canUseMeter() {
         return true;
@@ -2024,16 +2013,26 @@ ROOM_TEMPLATE = """
           if (audioContext && audioContext.state === "suspended") {
             await audioContext.resume();
           }
-          listenButton.hidden = true;
+          autoplayBlocked = false;
+          playerShell.classList.remove("awaiting-gesture");
           small.textContent = "Connecting audio...";
         } catch (error) {
           if (roomActive) {
-            listenButton.hidden = false;
-            small.textContent = "Tap once if your browser blocks audio.";
-          } else {
-            listenButton.hidden = true;
+            autoplayBlocked = true;
+            playerShell.classList.add("awaiting-gesture");
+            small.textContent = "Tap anywhere on this page if your browser blocks audio.";
+            return;
           }
+          autoplayBlocked = false;
+          playerShell.classList.remove("awaiting-gesture");
         }
+      }
+
+      function resumePlaybackFromGesture() {
+        if (!autoplayBlocked || !roomActive) {
+          return;
+        }
+        startPlayback().catch(() => {});
       }
 
       function refreshAudio() {
@@ -2072,18 +2071,20 @@ ROOM_TEMPLATE = """
           }
           if (status.broadcasting) {
             if (audio.paused || audio.readyState < 2) {
-              small.textContent = "Connecting audio...";
+              small.textContent = autoplayBlocked ? "Tap anywhere on this page if your browser blocks audio." : "Connecting audio...";
             } else {
               small.textContent = "Meeting active now.";
             }
           } else if (status.is_ingesting || status.desired_active) {
-            small.textContent = "Connecting audio...";
+            small.textContent = autoplayBlocked ? "Tap anywhere on this page if your browser blocks audio." : "Connecting audio...";
           } else {
             small.textContent = "Meeting not active right now. Leave this page open and it will reconnect when the audio begins.";
             paintMeter(0, 0);
             meterLabel.textContent = "Idle";
             meterPeakPercent = 0;
             meterPeakExpiresAt = 0;
+            autoplayBlocked = false;
+            playerShell.classList.remove("awaiting-gesture");
           }
         } catch (error) {
           small.textContent = "Status refresh failed. Retrying.";
@@ -2099,12 +2100,8 @@ ROOM_TEMPLATE = """
         volumeValue.textContent = `${value}%`;
       });
 
-      listenButton.addEventListener("click", () => {
-        refreshAudio();
-      });
       audio.addEventListener("canplay", () => {
         if (roomActive) {
-          listenButton.hidden = true;
           meterLabel.textContent = "Live";
           setChip(broadcastChip, "Meeting active now", "good");
           small.textContent = "Meeting active now.";
@@ -2120,15 +2117,22 @@ ROOM_TEMPLATE = """
         meterLabel.textContent = "Connecting";
         setChip(broadcastChip, "Connecting audio", "warn");
         if (roomActive) {
-          small.textContent = "Connecting audio...";
+          small.textContent = autoplayBlocked ? "Tap anywhere on this page if your browser blocks audio." : "Connecting audio...";
         }
       });
       audio.addEventListener("playing", () => {
-        listenButton.hidden = true;
+        autoplayBlocked = false;
+        playerShell.classList.remove("awaiting-gesture");
         if (audio.readyState >= 2 || audio.currentTime > 0) {
           meterLabel.textContent = "Live";
           setChip(broadcastChip, "Meeting active now", "good");
           small.textContent = "Meeting active now.";
+        }
+      });
+      document.addEventListener("pointerdown", resumePlaybackFromGesture, { passive: true });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          resumePlaybackFromGesture();
         }
       });
 
