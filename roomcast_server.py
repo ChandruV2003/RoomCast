@@ -28,7 +28,9 @@ from roomcast_store import RoomCastStore
 
 
 LISTENER_QUEUE_MAXSIZE = 6
-INGEST_CHUNK_SIZE = 2048
+# Keep ingest chunks aligned to 24-bit PCM frame boundaries so a listener can
+# join mid-stream without starting in the middle of a sample and hearing static.
+INGEST_CHUNK_SIZE = 3072
 RECENT_CHUNK_BACKLOG = 24
 LIVE_SNAPSHOT_WAIT_SECONDS = 6.0
 LIVE_SNAPSHOT_POLL_SECONDS = 0.2
@@ -237,6 +239,20 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     def _stream_profile():
         return STREAM_PROFILES[_stream_profile_name()]
+
+    def _stream_descriptor(snapshot: dict | None = None):
+        profile_name = _stream_profile_name()
+        descriptor = dict(_stream_profile())
+        runtime = (snapshot or {}).get("runtime") or {}
+        runtime_profile = (runtime.get("stream_profile") or "").strip().lower()
+        if runtime_profile in STREAM_PROFILES:
+            profile_name = runtime_profile
+            descriptor = dict(STREAM_PROFILES[profile_name])
+        if profile_name == "wav_pcm24":
+            descriptor["channels"] = max(1, int(runtime.get("stream_channels") or descriptor.get("channels", 1)))
+            descriptor["sample_rate_hz"] = max(8000, int(runtime.get("sample_rate_hz") or descriptor.get("sample_rate_hz", 48000)))
+            descriptor["bits_per_sample"] = max(16, int(runtime.get("sample_bits") or descriptor.get("bits_per_sample", 24)))
+        return descriptor
 
     def _display_timezone() -> ZoneInfo:
         return ZoneInfo("America/New_York")
@@ -1153,11 +1169,11 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         response.headers["Content-Disposition"] = f'attachment; filename="webcall-report-{meeting_id}.csv"'
         return response
 
-    def _audio_stream_response(stream_factory):
-        stream_profile = _stream_profile()
+    def _audio_stream_response(stream_factory, snapshot: dict | None = None):
+        stream_profile = _stream_descriptor(snapshot)
 
         def _stream():
-            if _stream_profile_name() == "wav_pcm24":
+            if stream_profile["mimetype"] == "audio/wav":
                 yield _wav_stream_header(
                     channels=stream_profile["channels"],
                     sample_rate_hz=stream_profile["sample_rate_hz"],
@@ -1196,7 +1212,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 yield from stream_hub.listen(room_slug)
             finally:
                 roomcast_store.end_listener_session(listener_session_id)
-        return _audio_stream_response(_stream)
+        return _audio_stream_response(_stream, _room_snapshot(room_slug))
 
     @app.get("/listen/live.mp3")
     def listen_live():
@@ -1212,7 +1228,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         )
         snapshot = _await_snapshot(snapshot_resolver)
         if not snapshot:
-            return Response(b"", mimetype=_stream_profile()["mimetype"], headers={
+            return Response(b"", mimetype=_stream_descriptor(snapshot)["mimetype"], headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate",
                 "Pragma": "no-cache",
                 "X-Accel-Buffering": "no",
@@ -1238,7 +1254,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             finally:
                 if listener_session_id is not None:
                     roomcast_store.end_listener_session(listener_session_id)
-        return _audio_stream_response(_stream)
+        return _audio_stream_response(_stream, snapshot)
 
     @app.get("/telephony/stream/<room_slug>.mp3")
     def telephony_stream(room_slug: str):
@@ -1268,7 +1284,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 yield from stream_hub.listen(room_slug)
             finally:
                 roomcast_store.end_listener_session(listener_session_id)
-        return _audio_stream_response(_stream)
+        return _audio_stream_response(_stream, _room_snapshot(room_slug))
 
     @app.route("/telephony/twilio/<webhook_token>/voice", methods=["GET", "POST"])
     def twilio_voice(webhook_token: str):
@@ -1324,6 +1340,10 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             is_ingesting=bool(payload.get("is_ingesting")),
             last_error=payload.get("last_error") or "",
             desired_active=host["desired_active"],
+            stream_profile=(payload.get("stream_profile") or "").strip(),
+            stream_channels=int(payload.get("stream_channels") or 1),
+            sample_rate_hz=int(payload.get("sample_rate_hz") or 48000),
+            sample_bits=int(payload.get("sample_bits") or 0),
         )
 
         refreshed = roomcast_store.get_host(host_slug, include_secret=True)
@@ -1344,6 +1364,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 "device_order": refreshed["device_order"],
                 "preferred_audio_pattern": refreshed["preferred_audio_pattern"],
                 "fallback_audio_pattern": refreshed["fallback_audio_pattern"],
+                "capture_mode": refreshed.get("capture_mode", "auto"),
                 "stream_profile": _stream_profile_name(),
                 "ingest_url": url_for(
                     "source_ingest",
@@ -1771,26 +1792,18 @@ ROOM_TEMPLATE = """
         width: 1.55rem;
         height: 0.66rem;
         border-radius: 999px;
-        background: rgba(135, 214, 255, 0.08);
-        border: 1px solid rgba(135, 214, 255, 0.08);
+        background: rgba(116, 221, 180, 0.06);
+        border: 1px solid rgba(116, 221, 180, 0.1);
         transition: background 120ms linear, border-color 120ms linear, transform 120ms linear;
       }
-      .meter-segment.is-on[data-band="low"] {
-        background: #74ff77;
-        border-color: rgba(116, 255, 119, 0.52);
+      .meter-segment.is-on {
+        background: linear-gradient(180deg, #93efbf 0%, #62d99e 100%);
+        border-color: rgba(116, 221, 180, 0.62);
       }
-      .meter-segment.is-on[data-band="mid"] {
-        background: #d5ff4a;
-        border-color: rgba(213, 255, 74, 0.5);
-      }
-      .meter-segment.is-on[data-band="high"] {
-        background: #ffb84a;
-        border-color: rgba(255, 184, 74, 0.48);
-      }
-      .meter-segment.is-on[data-band="peak"] {
-        background: #ff6b3d;
-        border-color: rgba(255, 107, 61, 0.58);
-        transform: translateY(-1px);
+      .meter-segment.is-peak {
+        background: #dfffea;
+        border-color: rgba(223, 255, 234, 0.92);
+        box-shadow: 0 0 0 1px rgba(7, 14, 20, 0.16) inset, 0 0 8px rgba(116, 221, 180, 0.18);
       }
       .slider-wrap {
         margin-top: 1rem;
@@ -1857,7 +1870,7 @@ ROOM_TEMPLATE = """
 
               <div class="meter">
                 <div class="meter-head">
-                  <span>Volume meter</span>
+                  <span>Signal level</span>
                   <span id="meter-label">{% if room.broadcasting or room.is_ingesting or room.desired_active %}Connecting{% else %}Idle{% endif %}</span>
                 </div>
                 <div class="meter-visual" id="meter-visual">
@@ -1914,6 +1927,8 @@ ROOM_TEMPLATE = """
       let sourceNode;
       let gainNode;
       let meterData;
+      let meterPeakPercent = 0;
+      let meterPeakExpiresAt = 0;
 
       function canUseMeter() {
         return true;
@@ -1935,12 +1950,22 @@ ROOM_TEMPLATE = """
         }
       }
 
-      function paintMeter(percent) {
+      function levelPercentFromLinear(linear) {
+        const safe = Math.max(linear, 0.00001);
+        const db = 20 * Math.log10(safe);
+        const clampedDb = Math.max(-60, Math.min(0, db));
+        return ((clampedDb + 60) / 60) * 100;
+      }
+
+      function paintMeter(percent, peakPercent = 0) {
         const clamped = Math.max(0, Math.min(100, percent));
-        const litSegments = Math.round((clamped / 100) * 14);
+        const segmentCount = meterColumns[0]?.children.length || 14;
+        const litSegments = Math.round((clamped / 100) * segmentCount);
+        const peakIndex = peakPercent > 0 ? Math.min(segmentCount - 1, Math.max(0, Math.round((peakPercent / 100) * segmentCount) - 1)) : -1;
         meterColumns.forEach((column) => {
           [...column.children].forEach((segment, index) => {
             segment.classList.toggle("is-on", index < litSegments);
+            segment.classList.toggle("is-peak", index === peakIndex);
           });
         });
       }
@@ -1954,9 +1979,9 @@ ROOM_TEMPLATE = """
         sourceNode = audioContext.createMediaElementSource(audio);
         gainNode = audioContext.createGain();
         analyser = audioContext.createAnalyser();
-        analyser.fftSize = 512;
-        analyser.smoothingTimeConstant = 0.82;
-        meterData = new Uint8Array(analyser.frequencyBinCount);
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.72;
+        meterData = new Uint8Array(analyser.fftSize);
         gainNode.gain.value = Number(volumeSlider.value) / 100;
         sourceNode.connect(gainNode);
         gainNode.connect(analyser);
@@ -1966,14 +1991,25 @@ ROOM_TEMPLATE = """
           if (!analyser) {
             return;
           }
-          analyser.getByteFrequencyData(meterData);
+          analyser.getByteTimeDomainData(meterData);
           let peak = 0;
+          const center = 128;
           for (const value of meterData) {
-            peak = Math.max(peak, value);
+            peak = Math.max(peak, Math.abs((value - center) / center));
           }
-          const percent = Math.max(0, Math.min(100, Math.round((peak / 255) * 100)));
-          paintMeter(percent);
-          meterLabel.textContent = percent <= 6 ? "Idle" : `${percent}%`;
+          const percent = levelPercentFromLinear(peak);
+          const now = Date.now();
+          if (percent >= meterPeakPercent || now >= meterPeakExpiresAt) {
+            meterPeakPercent = percent;
+            meterPeakExpiresAt = now + 420;
+          }
+          paintMeter(percent, meterPeakPercent);
+          if (percent <= 6) {
+            meterLabel.textContent = "Idle";
+          } else {
+            const peakDb = Math.max(-60, Math.min(0, 20 * Math.log10(Math.max(peak, 0.00001))));
+            meterLabel.textContent = `${Math.round(peakDb)} dB`;
+          }
         }, 120);
       }
 
@@ -2044,8 +2080,10 @@ ROOM_TEMPLATE = """
             small.textContent = "Connecting audio...";
           } else {
             small.textContent = "Meeting not active right now. Leave this page open and it will reconnect when the audio begins.";
-            paintMeter(0);
+            paintMeter(0, 0);
             meterLabel.textContent = "Idle";
+            meterPeakPercent = 0;
+            meterPeakExpiresAt = 0;
           }
         } catch (error) {
           small.textContent = "Status refresh failed. Retrying.";
@@ -2094,7 +2132,7 @@ ROOM_TEMPLATE = """
         }
       });
 
-      paintMeter(0);
+      paintMeter(0, 0);
       rebuildStreamUrl();
       setInterval(pollStatus, 750);
       pollStatus();
@@ -4159,26 +4197,18 @@ ADMIN_TEMPLATE = """
         width: 1.15rem;
         height: 0.48rem;
         border-radius: 999px;
-        background: rgba(135, 214, 255, 0.08);
-        border: 1px solid rgba(135, 214, 255, 0.08);
+        background: rgba(116, 221, 180, 0.06);
+        border: 1px solid rgba(116, 221, 180, 0.1);
         transition: background 120ms linear, border-color 120ms linear, transform 120ms linear;
       }
-      .meter-segment.is-on[data-band="low"] {
-        background: #74ff77;
-        border-color: rgba(116, 255, 119, 0.52);
+      .meter-segment.is-on {
+        background: linear-gradient(180deg, #93efbf 0%, #62d99e 100%);
+        border-color: rgba(116, 221, 180, 0.62);
       }
-      .meter-segment.is-on[data-band="mid"] {
-        background: #d5ff4a;
-        border-color: rgba(213, 255, 74, 0.5);
-      }
-      .meter-segment.is-on[data-band="high"] {
-        background: #ffb84a;
-        border-color: rgba(255, 184, 74, 0.48);
-      }
-      .meter-segment.is-on[data-band="peak"] {
-        background: #ff6b3d;
-        border-color: rgba(255, 107, 61, 0.58);
-        transform: translateY(-1px);
+      .meter-segment.is-peak {
+        background: #dfffea;
+        border-color: rgba(223, 255, 234, 0.92);
+        box-shadow: 0 0 0 1px rgba(7, 14, 20, 0.16) inset, 0 0 8px rgba(116, 221, 180, 0.18);
       }
       .banner {
         border-radius: 12px;
@@ -4635,17 +4665,29 @@ ADMIN_TEMPLATE = """
           let adminAnalyser;
           let adminSourceNode;
           let adminMeterData;
+          let adminMeterPeakPercent = 0;
+          let adminMeterPeakExpiresAt = 0;
           let refreshInFlight = false;
 
           function canUseMeter() {
             return true;
           }
 
-          function paintMeter(columns, percent) {
-            const litSegments = Math.round((Math.max(0, Math.min(100, percent)) / 100) * 14);
+          function levelPercentFromLinear(linear) {
+            const safe = Math.max(linear, 0.00001);
+            const db = 20 * Math.log10(safe);
+            const clampedDb = Math.max(-60, Math.min(0, db));
+            return ((clampedDb + 60) / 60) * 100;
+          }
+
+          function paintMeter(columns, percent, peakPercent = 0) {
+            const segmentCount = columns[0]?.children.length || 14;
+            const litSegments = Math.round((Math.max(0, Math.min(100, percent)) / 100) * segmentCount);
+            const peakIndex = peakPercent > 0 ? Math.min(segmentCount - 1, Math.max(0, Math.round((peakPercent / 100) * segmentCount) - 1)) : -1;
             columns.forEach((column) => {
               [...column.children].forEach((segment, index) => {
                 segment.classList.toggle("is-on", index < litSegments);
+                segment.classList.toggle("is-peak", index === peakIndex);
               });
             });
           }
@@ -4658,24 +4700,33 @@ ADMIN_TEMPLATE = """
             adminAudioContext = adminAudioContext || new Context();
             adminSourceNode = adminAudioContext.createMediaElementSource(adminAudio);
             adminAnalyser = adminAudioContext.createAnalyser();
-            adminAnalyser.fftSize = 512;
-            adminAnalyser.smoothingTimeConstant = 0.82;
-            adminMeterData = new Uint8Array(adminAnalyser.frequencyBinCount);
+            adminAnalyser.fftSize = 1024;
+            adminAnalyser.smoothingTimeConstant = 0.72;
+            adminMeterData = new Uint8Array(adminAnalyser.fftSize);
             adminSourceNode.connect(adminAnalyser);
 
             window.setInterval(() => {
               if (!adminAnalyser) {
                 return;
               }
-              adminAnalyser.getByteFrequencyData(adminMeterData);
+              adminAnalyser.getByteTimeDomainData(adminMeterData);
               let peak = 0;
+              const center = 128;
               for (const value of adminMeterData) {
-                peak = Math.max(peak, value);
+                peak = Math.max(peak, Math.abs((value - center) / center));
               }
-              const percent = Math.max(0, Math.min(100, Math.round((peak / 255) * 100)));
-              paintMeter(adminMeterColumns, percent);
+              const percent = levelPercentFromLinear(peak);
+              const now = Date.now();
+              if (percent >= adminMeterPeakPercent || now >= adminMeterPeakExpiresAt) {
+                adminMeterPeakPercent = percent;
+                adminMeterPeakExpiresAt = now + 420;
+              }
+              paintMeter(adminMeterColumns, percent, adminMeterPeakPercent);
               if (percent > 6) {
-                adminMeterLabel.textContent = `${percent}%`;
+                const peakDb = Math.max(-60, Math.min(0, 20 * Math.log10(Math.max(peak, 0.00001))));
+                adminMeterLabel.textContent = `${Math.round(peakDb)} dB`;
+              } else {
+                adminMeterLabel.textContent = "Idle";
               }
             }, 120);
           }
@@ -4703,6 +4754,9 @@ ADMIN_TEMPLATE = """
             adminAudio.src = `${adminStreamBase}&v=${Date.now()}`;
             adminAudio.load();
             adminMeterLabel.textContent = "Connecting";
+            adminMeterPeakPercent = 0;
+            adminMeterPeakExpiresAt = 0;
+            paintMeter(adminMeterColumns, 0, 0);
             startAdminMonitor().catch(() => {});
           }
 

@@ -76,6 +76,7 @@ class RoomCastAgent:
         self.silence_triggered = False
         self.restart_not_before = 0.0
         self.stream_profile = "mp3"
+        self.capture_mode = "auto"
 
     def _silence_warning_message(self) -> str:
         return (
@@ -181,35 +182,73 @@ class RoomCastAgent:
                     ordered.append(text)
         return ordered
 
-    @staticmethod
-    def _audio_profile(device_name: str | None, stream_profile: str = "mp3"):
+    def _resolve_capture_mode(self, device_name: str | None, requested_mode: str | None = None):
+        configured = (requested_mode or self.capture_mode or "auto").strip().lower() or "auto"
+        if configured != "auto":
+            return configured
+
         name = (device_name or "").casefold()
-        normalize_to_mono = stream_profile == "wav_pcm24"
+        if "sq-7" in name or "sq7" in name or "cq-18t" in name or "cq18t" in name:
+            return "stereo"
+        if any(marker in name for marker in ("analogue 1 + 2", "analog 1 + 2", "line 1 + 2")):
+            if self.host_slug == "hp-envy-16-ad0xx":
+                return "mono-left"
+            if self.host_slug == "hp-pavilion-14m-ba1xx":
+                return "mono-right"
+            return "mono-left"
+        if "stereo mix" in name:
+            return "stereo"
+        return "mono"
+
+    def _audio_profile(self, device_name: str | None, stream_profile: str = "mp3", capture_mode: str | None = None):
+        name = (device_name or "").casefold()
+        resolved_mode = self._resolve_capture_mode(device_name, capture_mode)
         if "stereo mix" in name:
             profile = {
                 "channels": 2,
                 "bitrate": "192k",
                 "filter_prefix": [],
             }
-            if normalize_to_mono:
+            if resolved_mode == "mono-sum":
                 profile["channels"] = 1
-                profile["bitrate"] = ""
+                profile["bitrate"] = "128k" if stream_profile == "mp3" else ""
                 profile["filter_prefix"] = ["pan=mono|c0=.5*c0+.5*c1"]
+            elif resolved_mode == "mono-left":
+                profile["channels"] = 1
+                profile["bitrate"] = "128k" if stream_profile == "mp3" else ""
+                profile["filter_prefix"] = ["pan=mono|c0=c0"]
+            elif resolved_mode == "mono-right":
+                profile["channels"] = 1
+                profile["bitrate"] = "128k" if stream_profile == "mp3" else ""
+                profile["filter_prefix"] = ["pan=mono|c0=c1"]
             return profile
 
-        # Focusrite line pairs are showing up as stereo devices even though the room feed
-        # is arriving as a single mono program on the left channel. Preserve that channel
-        # directly instead of averaging it with the effectively-dead right side.
-        left_channel_markers = (
-            "analogue 1 + 2",
-            "analog 1 + 2",
-            "line 1 + 2",
-        )
-        if any(marker in name for marker in left_channel_markers):
+        if resolved_mode == "stereo":
+            return {
+                "channels": 2,
+                "bitrate": "192k" if stream_profile == "mp3" else "",
+                "filter_prefix": [],
+            }
+
+        if resolved_mode == "mono-left":
             return {
                 "channels": 1,
-                "bitrate": "128k",
+                "bitrate": "128k" if stream_profile == "mp3" else "",
                 "filter_prefix": ["pan=mono|c0=c0"],
+            }
+
+        if resolved_mode == "mono-right":
+            return {
+                "channels": 1,
+                "bitrate": "128k" if stream_profile == "mp3" else "",
+                "filter_prefix": ["pan=mono|c0=c1"],
+            }
+
+        if resolved_mode == "mono-sum":
+            return {
+                "channels": 1,
+                "bitrate": "128k" if stream_profile == "mp3" else "",
+                "filter_prefix": ["pan=mono|c0=.5*c0+.5*c1"],
             }
 
         return {
@@ -238,7 +277,7 @@ class RoomCastAgent:
         return devices[0] if devices else None
 
     def send_heartbeat(self):
-        stream_preview = self._audio_profile(self.current_device or None, self.stream_profile)
+        stream_preview = self._audio_profile(self.current_device or None, self.stream_profile, self.capture_mode)
         payload = {
             "host_slug": self.host_slug,
             "token": self.token,
@@ -250,6 +289,7 @@ class RoomCastAgent:
             "stream_channels": stream_preview["channels"],
             "sample_rate_hz": 48000,
             "sample_bits": 24 if self.stream_profile == "wav_pcm24" else 0,
+            "capture_mode": self._resolve_capture_mode(self.current_device or None, self.capture_mode),
         }
         response = requests.post(
             f"{self.server_url}/api/source/heartbeat",
@@ -261,7 +301,7 @@ class RoomCastAgent:
 
     def _build_ffmpeg_command(self, ingest_url: str, device_name: str, stream_profile: str | None = None):
         active_stream_profile = (stream_profile or self.stream_profile or "mp3").strip().lower() or "mp3"
-        profile = self._audio_profile(device_name, active_stream_profile)
+        profile = self._audio_profile(device_name, active_stream_profile, self.capture_mode)
         command = [
             self.ffmpeg_path,
             "-hide_banner",
@@ -437,6 +477,7 @@ class RoomCastAgent:
                 reply = self.send_heartbeat()
                 self.desired_active = bool(reply.get("desired_active"))
                 self.stream_profile = (reply.get("stream_profile") or self.stream_profile or "mp3").strip().lower() or "mp3"
+                self.capture_mode = (reply.get("capture_mode") or self.capture_mode or "auto").strip().lower() or "auto"
                 if self.last_error != self._silence_warning_message():
                     self.last_error = ""
 

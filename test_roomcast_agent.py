@@ -116,6 +116,21 @@ class RoomCastAgentTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ac") + 1], "2")
         self.assertEqual(command[command.index("-b:a") + 1], "192k")
 
+    def test_sq7_devices_switch_to_stereo_when_present(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+        agent.host_slug = "hp-envy-16-ad0xx"
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "SQ-7 USB Audio",
+            "wav_pcm24",
+        )
+
+        self.assertEqual(command[command.index("-ac") + 1], "2")
+        self.assertEqual(command[command.index("-ar") + 1], "48000")
+        self.assertNotIn("pan=mono|c0=c0", command)
+
     def test_wav_pcm24_profile_uses_raw_pcm_transport(self):
         agent = self._make_agent()
         agent.test_tone = False
