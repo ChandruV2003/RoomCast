@@ -11,7 +11,8 @@ param(
     [string]$RepoPath = (Split-Path -Parent $PSCommandPath),
     [string]$TaskName = "WebCall Source Agent",
     [string]$PythonLauncher = "py",
-    [string]$PythonSelector = ""
+    [string]$PythonSelector = "",
+    [int]$PollIntervalSeconds = 1
 )
 
 $resolvedRepo = (Resolve-Path $RepoPath).Path
@@ -42,6 +43,7 @@ $agentLaunch = @(
     "--server-url '$ServerUrl'"
     "--host-slug '$HostSlug'"
     "--token '$Token'"
+    "--poll-interval '$PollIntervalSeconds'"
 ) -join " "
 
 $command = @(
@@ -56,12 +58,19 @@ $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument "-NoProfile -WindowStyle Hidden -Command `$ErrorActionPreference = 'Stop'; $command"
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -MultipleInstances IgnoreNew
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $env:USERNAME `
+    -LogonType Interactive `
+    -RunLevel Highest
 
 try {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
@@ -93,8 +102,9 @@ if (Test-Path $lockPath) {
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger @($logonTrigger, $startupTrigger) `
     -Settings $settings `
+    -Principal $principal `
     -Description "WebCall source agent for $HostSlug" `
     -Force | Out-Null
 

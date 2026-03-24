@@ -734,6 +734,38 @@ class RoomCastStore:
                 (_utc_now(), session_id),
             )
 
+    def _end_active_listener_sessions(self, connection, room_slug: str, ended_at: str):
+        connection.execute(
+            """
+            UPDATE listener_sessions
+            SET left_at = ?
+            WHERE room_slug = ? AND left_at IS NULL
+            """,
+            (ended_at, room_slug),
+        )
+
+    def end_active_listener_sessions(self, room_slug: str):
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            self._end_active_listener_sessions(connection, room_slug, timestamp)
+
+    def close_orphaned_listener_sessions(self):
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE listener_sessions
+                SET left_at = ?
+                WHERE left_at IS NULL
+                  AND room_slug NOT IN (
+                      SELECT room_slug
+                      FROM meeting_sessions
+                      WHERE ended_at IS NULL
+                  )
+                """,
+                (timestamp,),
+            )
+
     def list_listener_sessions(self, room_slug: str, *, active_only: bool = False, limit: int = 12):
         query = """
             SELECT id, room_slug, channel, participant_label, participant_key, ip_address, user_agent, joined_at, left_at
@@ -867,6 +899,7 @@ class RoomCastStore:
                             """,
                             (timestamp, actor or trigger_mode, row["id"]),
                         )
+                        self._end_active_listener_sessions(connection, row["room_slug"], timestamp)
                 if current:
                     return int(current["id"])
 
@@ -888,6 +921,7 @@ class RoomCastStore:
                     """,
                     (timestamp, actor or trigger_mode, current["id"]),
                 )
+                self._end_active_listener_sessions(connection, room_slug, timestamp)
                 return int(current["id"])
 
             return None

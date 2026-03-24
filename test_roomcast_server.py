@@ -225,6 +225,57 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"Meeting,Tarry Meeting Hall", response.data)
         self.assertIn(b"Web 127.0.0.1", response.data)
 
+    def test_admin_stop_call_closes_active_listener_sessions(self):
+        self.client.post(
+            "/admin/login",
+            data={"password": "test-password"},
+            follow_redirects=True,
+        )
+        self.app.roomcast_store.sync_meeting_state(
+            "meeting-hall",
+            active=True,
+            host_slug="hp-pavilion-14m-ba1xx",
+            trigger_mode="admin",
+            actor="test",
+        )
+        self.app.roomcast_store.begin_listener_session(
+            "meeting-hall",
+            channel="web",
+            participant_label="Web 127.0.0.1",
+            participant_key="listener-1",
+            ip_address="127.0.0.1",
+            user_agent="pytest",
+        )
+
+        response = self.client.post(
+            "/admin/call/stop",
+            data={"room_slug": "meeting-hall"},
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.app.roomcast_store.list_listener_sessions("meeting-hall", active_only=True),
+            [],
+        )
+
+    def test_admin_stop_call_terminates_live_room_stream(self):
+        self.client.post(
+            "/admin/login",
+            data={"password": "test-password"},
+            follow_redirects=True,
+        )
+        self.app.stream_hub.start_broadcast("meeting-hall", "hp-pavilion-14m-ba1xx")
+
+        response = self.client.post(
+            "/admin/call/stop",
+            data={"room_slug": "meeting-hall"},
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.app.stream_hub.status("meeting-hall")["broadcasting"])
+
     def test_stream_hub_uses_small_listener_queue(self):
         hub = RoomStreamHub()
         room = hub._get_room("meeting-hall")

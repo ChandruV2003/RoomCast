@@ -1,7 +1,9 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 os.environ["ROOMCAST_DEFAULT_PIN"] = "7070"
 
@@ -42,10 +44,31 @@ class RoomCastStoreTests(unittest.TestCase):
             ],
         )
 
-    def test_schedule_end_waits_for_silence_warning_before_stopping(self):
+    def test_disabled_schedule_does_not_hold_room_active(self):
         self.store.replace_host_schedule(
             "hp-pavilion-14m-ba1xx",
             [{"day": "SAT", "start": "18:00", "end": "20:00", "enabled": False}],
+        )
+        self.store.record_heartbeat(
+            "hp-pavilion-14m-ba1xx",
+            current_device="Microphone (Scarlett Solo 4th Gen)",
+            devices=["Microphone (Scarlett Solo 4th Gen)"],
+            is_ingesting=True,
+            last_error="",
+            desired_active=False,
+        )
+        host = self.store.get_host("hp-pavilion-14m-ba1xx")
+        self.assertFalse(host["desired_active"])
+
+    def test_recent_schedule_end_waits_for_silence_warning_before_stopping(self):
+        tz = ZoneInfo("America/New_York")
+        now = datetime.now(tz).replace(second=0, microsecond=0)
+        start = (now - timedelta(minutes=35)).strftime("%H:%M")
+        end = (now - timedelta(minutes=10)).strftime("%H:%M")
+        day = now.strftime("%a").upper()[:3]
+        self.store.replace_host_schedule(
+            "hp-pavilion-14m-ba1xx",
+            [{"day": day, "start": start, "end": end, "enabled": True}],
         )
         self.store.record_heartbeat(
             "hp-pavilion-14m-ba1xx",
@@ -83,6 +106,45 @@ class RoomCastStoreTests(unittest.TestCase):
         self.store.end_listener_session(session_id)
         active_after = self.store.list_listener_sessions("meeting-hall", active_only=True)
         self.assertEqual(active_after, [])
+
+    def test_sync_meeting_state_closes_active_listeners_when_meeting_ends(self):
+        self.store.sync_meeting_state(
+            "meeting-hall",
+            active=True,
+            host_slug="hp-pavilion-14m-ba1xx",
+            trigger_mode="admin",
+            actor="test",
+        )
+        self.store.begin_listener_session(
+            "meeting-hall",
+            channel="web",
+            participant_label="Web 127.0.0.1",
+            participant_key="session-1",
+            ip_address="127.0.0.1",
+            user_agent="pytest",
+        )
+
+        self.store.sync_meeting_state(
+            "meeting-hall",
+            active=False,
+            host_slug="hp-pavilion-14m-ba1xx",
+            trigger_mode="admin",
+            actor="test",
+        )
+
+        self.assertEqual(self.store.list_listener_sessions("meeting-hall", active_only=True), [])
+
+    def test_close_orphaned_listener_sessions_clears_rows_without_live_meeting(self):
+        self.store.begin_listener_session(
+            "study-room",
+            channel="web",
+            participant_label="Web 127.0.0.1",
+            participant_key="session-2",
+            ip_address="127.0.0.1",
+            user_agent="pytest",
+        )
+        self.store.close_orphaned_listener_sessions()
+        self.assertEqual(self.store.list_listener_sessions("study-room", active_only=True), [])
 
     def test_meeting_report_collects_listeners_and_incidents(self):
         self.store.sync_meeting_state(

@@ -223,6 +223,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     roomcast_store = store or RoomCastStore(app.config.get("ROOMCAST_DB_PATH"))
     stream_hub = hub or RoomStreamHub()
+    roomcast_store.close_orphaned_listener_sessions()
     app.roomcast_store = roomcast_store
     app.stream_hub = stream_hub
     geolookup_cache: dict[str, tuple[float, str | None]] = {}
@@ -611,6 +612,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 trigger_mode=trigger_mode,
                 actor=actor,
             )
+
+    def _terminate_room_stream(room_slug: str):
+        hub_status = stream_hub.status(room_slug)
+        active_host_slug = hub_status.get("active_host_slug")
+        if active_host_slug:
+            stream_hub.finish_broadcast(room_slug, active_host_slug)
 
     def _device_order_from_form():
         ordered = []
@@ -1053,6 +1060,9 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 device_order=host["device_order"],
             )
         _sync_visible_meetings("admin-start")
+        for host in _visible_hosts():
+            if host["room_slug"] != room_slug:
+                _terminate_room_stream(host["room_slug"])
         return redirect(url_for("admin_panel", room=room_slug, message=f"{_room_alias(room_slug, room_slug)} is starting."))
 
     @app.post("/admin/call/stop")
@@ -1071,6 +1081,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 device_order=host["device_order"],
             )
         _sync_visible_meetings("admin-stop")
+        _terminate_room_stream(room_slug)
         return redirect(url_for("admin_panel", message=f"{_room_alias(room_slug, room_slug)} was stopped."))
 
     @app.post("/admin/call/schedule")
@@ -1354,6 +1365,8 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             trigger_mode=refreshed["manual_mode"] if refreshed["manual_mode"] != "auto" else "schedule",
             actor="agent-heartbeat",
         )
+        if not refreshed["desired_active"]:
+            _terminate_room_stream(refreshed["room_slug"])
         return jsonify(
             {
                 "ok": True,
