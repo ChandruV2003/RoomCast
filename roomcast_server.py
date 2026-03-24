@@ -452,21 +452,22 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         hosts = []
         for host in roomcast_store.list_hosts(include_secret=True):
             runtime = host.get("runtime") or {}
+            runtime_online = _runtime_online(host)
             device_options = _device_options(host, runtime)
             schedule_rows = _schedule_rows_display(host["schedules"])
             active_schedule_rows = [row for row in schedule_rows if row["enabled"]]
             hosts.append(
                 {
                     **host,
-                    "source_online": _runtime_online(host),
+                    "source_online": runtime_online,
                     "current_device": runtime.get("current_device", ""),
                     "known_devices": runtime.get("devices", []),
                     "device_options": device_options,
                     "device_slots": _device_slots(device_options, host.get("device_order", [])),
                     "schedule_rows": schedule_rows,
                     "active_schedule_rows": active_schedule_rows,
-                    "last_error": _compact_error(runtime.get("last_error", "")),
-                    "is_ingesting": runtime.get("is_ingesting", False),
+                    "last_error": _compact_error(runtime.get("last_error", "")) if runtime_online else "",
+                    "is_ingesting": bool(runtime.get("is_ingesting", False)) if runtime_online else False,
                     "last_seen_at": runtime.get("last_seen_at"),
                     "priority": host.get("priority", 0),
                     "room_alias": _room_alias(host["room_slug"], host["room_label"]),
