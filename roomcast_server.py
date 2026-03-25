@@ -460,8 +460,8 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 {
                     **host,
                     "source_online": runtime_online,
-                    "current_device": runtime.get("current_device", ""),
-                    "known_devices": runtime.get("devices", []),
+                    "current_device": runtime.get("current_device", "") if runtime_online else "",
+                    "known_devices": runtime.get("devices", []) if runtime_online else [],
                     "device_options": device_options,
                     "device_slots": _device_slots(device_options, host.get("device_order", [])),
                     "schedule_rows": schedule_rows,
@@ -1041,6 +1041,27 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             panel_url=url_for("admin_panel"),
             logout_url=url_for("admin_logout"),
         )
+
+    @app.get("/api/admin/runtime")
+    def admin_runtime():
+        if not _is_admin():
+            return jsonify({"error": "unauthorized"}), 403
+
+        hosts = []
+        for host in _visible_hosts():
+            hosts.append(
+                {
+                    "slug": host["slug"],
+                    "room_slug": host["room_slug"],
+                    "room_alias": host["room_alias"],
+                    "source_online": host["source_online"],
+                    "current_device": host["current_device"],
+                    "known_devices": host["known_devices"],
+                    "device_options": host["device_options"],
+                    "last_seen_at": host["last_seen_at"],
+                }
+            )
+        return jsonify({"hosts": hosts})
 
     @app.post("/admin/call/start")
     def admin_start_call():
@@ -1679,15 +1700,15 @@ ROOM_TEMPLATE = """
         min-height: 100vh;
       }
       main {
-        max-width: 760px;
+        max-width: 700px;
         margin: 0 auto;
-        padding: 1rem 1rem 3rem;
+        padding: 0.9rem 0.9rem 2.25rem;
       }
       .shell {
         background: rgba(12, 20, 30, 0.96);
         border: 1px solid var(--line);
         border-radius: 16px;
-        padding: 1rem;
+        padding: 0.95rem;
         box-shadow: var(--shadow);
       }
       .eyebrow {
@@ -1706,29 +1727,31 @@ ROOM_TEMPLATE = """
       }
       .brand {
         display: grid;
-        gap: 0.3rem;
+        gap: 0.22rem;
         justify-items: center;
         text-align: center;
       }
       .brand h1 {
         margin: 0.15rem 0 0;
-        font-size: clamp(2.1rem, 8vw, 3.6rem);
+        font-size: clamp(1.95rem, 7vw, 3.1rem);
         line-height: 0.96;
       }
       .brand p {
         margin: 0;
         color: var(--muted);
+        max-width: 26rem;
+        line-height: 1.38;
       }
       .stack {
         display: grid;
-        gap: 1rem;
-        margin-top: 1rem;
+        gap: 0.85rem;
+        margin-top: 0.85rem;
       }
       .panel {
         border-radius: 14px;
         border: 1px solid var(--line);
         background: var(--surface);
-        padding: 1rem;
+        padding: 0.9rem;
       }
       .chips {
         display: flex;
@@ -1755,11 +1778,11 @@ ROOM_TEMPLATE = """
         color: var(--warn);
       }
       .player-shell {
-        margin-top: 1rem;
+        margin-top: 0.75rem;
         border-radius: 14px;
         border: 1px solid var(--line);
         background: var(--surface-2);
-        padding: 1rem;
+        padding: 0.9rem;
         transition: border-color 120ms linear, box-shadow 120ms linear;
       }
       .player-shell.awaiting-gesture {
@@ -1768,7 +1791,7 @@ ROOM_TEMPLATE = """
       }
       .meter {
         display: grid;
-        gap: 0.8rem;
+        gap: 0.7rem;
       }
       .meter-head {
         display: flex;
@@ -1782,10 +1805,10 @@ ROOM_TEMPLATE = """
       .meter-visual {
         display: flex;
         justify-content: center;
-        gap: 0.9rem;
+        gap: 0.78rem;
         align-items: end;
-        min-height: 11rem;
-        padding: 0.25rem 0;
+        min-height: 8.6rem;
+        padding: 0.15rem 0;
       }
       .meter-column {
         display: flex;
@@ -1810,7 +1833,7 @@ ROOM_TEMPLATE = """
         box-shadow: 0 0 0 1px rgba(7, 14, 20, 0.16) inset, 0 0 8px rgba(116, 221, 180, 0.18);
       }
       .slider-wrap {
-        margin-top: 1rem;
+        margin-top: 0.75rem;
       }
       .slider-wrap label {
         display: flex;
@@ -1826,7 +1849,7 @@ ROOM_TEMPLATE = """
         margin-top: 0.55rem;
       }
       .small {
-        margin-top: 0.9rem;
+        margin-top: 0.75rem;
         color: var(--muted);
         font-size: 0.9rem;
         line-height: 1.45;
@@ -3924,24 +3947,24 @@ ADMIN_TEMPLATE = """
       main {
         max-width: 1120px;
         margin: 0 auto;
-        padding: 1rem 1rem 2.5rem;
+        padding: 0.9rem 0.9rem 2rem;
       }
       .topbar {
         display: grid;
         grid-template-columns: auto 1fr auto;
-        gap: 1rem;
+        gap: 0.85rem;
         align-items: center;
-        margin-bottom: 1rem;
+        margin-bottom: 0.9rem;
       }
       .brand {
         display: grid;
-        gap: 0.3rem;
+        gap: 0.22rem;
         justify-items: center;
         text-align: center;
       }
       .brand h1 {
         margin: 0.15rem 0 0;
-        font-size: clamp(2rem, 6vw, 3.2rem);
+        font-size: clamp(1.82rem, 5.6vw, 2.8rem);
         line-height: 0.96;
       }
       .brand p {
@@ -4011,13 +4034,13 @@ ADMIN_TEMPLATE = """
       .ghost-button,
       .secondary-button,
       .close-button {
-        padding: 0.82rem 1.08rem;
+        padding: 0.72rem 0.96rem;
         font-weight: 700;
         cursor: pointer;
       }
       .primary-button {
         border: 0;
-        padding: 1rem 1.85rem;
+        padding: 0.92rem 1.5rem;
         background: #dff4ff;
         color: #081018;
         font-weight: 800;
@@ -4026,13 +4049,13 @@ ADMIN_TEMPLATE = """
       .primary-button,
       .ghost-button,
       .secondary-button {
-        min-height: 4.15rem;
-        min-width: 17rem;
+        min-height: 3.55rem;
+        min-width: 14.25rem;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        font-size: 1.15rem;
-        padding: 1rem 1.7rem;
+        font-size: 1.04rem;
+        padding: 0.92rem 1.45rem;
       }
       .secondary-button {
         color: var(--bad);
@@ -4067,13 +4090,13 @@ ADMIN_TEMPLATE = """
         border-color: var(--line-strong);
       }
       .control-shell {
-        padding: 1.15rem;
+        padding: 1rem;
         display: grid;
-        gap: 1rem;
+        gap: 0.85rem;
       }
       .transport-head {
         display: grid;
-        gap: 0.45rem;
+        gap: 0.35rem;
         justify-items: center;
         text-align: center;
       }
@@ -4089,12 +4112,12 @@ ADMIN_TEMPLATE = """
       }
       .transport-head h2 {
         margin: 0;
-        font-size: clamp(1.85rem, 4vw, 2.45rem);
+        font-size: clamp(1.55rem, 3.6vw, 2.05rem);
         line-height: 1.02;
       }
       .transport-head p {
-        max-width: 36rem;
-        font-size: 0.98rem;
+        max-width: 32rem;
+        font-size: 0.94rem;
       }
       .chips {
         display: flex;
@@ -4127,7 +4150,7 @@ ADMIN_TEMPLATE = """
       .transport-actions {
         display: flex;
         justify-content: center;
-        gap: 0.85rem;
+        gap: 0.7rem;
         flex-wrap: wrap;
       }
       .transport-actions form {
@@ -4136,18 +4159,18 @@ ADMIN_TEMPLATE = """
       }
       .transport-actions form button,
       .transport-actions > button {
-        min-width: 17rem;
+        min-width: 14.25rem;
       }
       .metric-strip {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 0.75rem;
+        gap: 0.7rem;
       }
       .metric {
         border: 1px solid var(--line);
         border-radius: 14px;
         background: var(--surface);
-        padding: 1rem;
+        padding: 0.88rem;
         text-align: center;
       }
       .metric span {
@@ -4160,12 +4183,12 @@ ADMIN_TEMPLATE = """
       }
       .metric strong {
         display: block;
-        margin-top: 0.48rem;
-        font-size: 1.84rem;
+        margin-top: 0.42rem;
+        font-size: 1.58rem;
         line-height: 1.1;
       }
       .metric.is-wide strong {
-        font-size: 1.58rem;
+        font-size: 1.28rem;
         line-height: 1.16;
       }
       .alert-stack {
@@ -4173,7 +4196,7 @@ ADMIN_TEMPLATE = """
         gap: 0.75rem;
       }
       .monitor-panel {
-        padding: 1.1rem;
+        padding: 0.95rem 1rem;
       }
       .monitor-grid {
         display: grid;
@@ -4202,9 +4225,9 @@ ADMIN_TEMPLATE = """
       .meter-visual {
         display: flex;
         justify-content: center;
-        gap: 0.8rem;
+        gap: 0.68rem;
         align-items: end;
-        min-height: 9.8rem;
+        min-height: 7.4rem;
       }
       .meter-column {
         display: flex;
@@ -4250,7 +4273,7 @@ ADMIN_TEMPLATE = """
         display: flex;
         gap: 0.65rem;
         flex-wrap: wrap;
-        margin-bottom: 1rem;
+        margin-bottom: 0.85rem;
         justify-content: flex-start;
       }
       .view-tab {
@@ -4274,7 +4297,7 @@ ADMIN_TEMPLATE = """
       }
       .block,
       .reports {
-        padding: 1.1rem;
+        padding: 0.95rem;
       }
       .block {
         border: 1px solid var(--line);
@@ -4433,22 +4456,21 @@ ADMIN_TEMPLATE = """
           grid-template-columns: 1fr;
         }
         .transport-actions,
-        .dialog-actions,
-        .top-actions {
+        .dialog-actions {
           width: 100%;
         }
         .transport-actions form,
         .transport-actions button,
         .transport-actions a,
-        .top-actions form,
-        .top-actions a,
-        .top-actions button,
         .dialog-actions button,
         .primary-button,
         .secondary-button,
-        .ghost-button,
-        .utility-button {
+        .ghost-button {
           width: 100%;
+        }
+        .top-actions,
+        .top-actions form {
+          width: auto;
         }
       }
     </style>
@@ -4965,18 +4987,18 @@ SETTINGS_TEMPLATE = """
       main {
         max-width: 1120px;
         margin: 0 auto;
-        padding: 1rem 1rem 2.5rem;
+        padding: 0.9rem 0.9rem 2.15rem;
       }
       .topbar {
         display: grid;
         grid-template-columns: auto 1fr auto;
-        gap: 1rem;
+        gap: 0.85rem;
         align-items: center;
-        margin-bottom: 1rem;
+        margin-bottom: 0.9rem;
       }
       .brand {
         display: grid;
-        gap: 0.25rem;
+        gap: 0.2rem;
         justify-items: center;
         text-align: center;
       }
@@ -5089,12 +5111,15 @@ SETTINGS_TEMPLATE = """
         color: var(--bad);
       }
       .notice {
-        padding: 1rem;
+        padding: 0.92rem 1rem;
+      }
+      .is-hidden {
+        display: none !important;
       }
       .room-tabs {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 0.85rem;
+        gap: 0.75rem;
       }
       #settings-shell {
         display: grid;
@@ -5104,7 +5129,7 @@ SETTINGS_TEMPLATE = """
       .room-tab {
         display: grid;
         gap: 0.15rem;
-        padding: 0.9rem 1rem;
+        padding: 0.82rem 0.95rem;
         text-align: left;
         cursor: pointer;
       }
@@ -5121,7 +5146,7 @@ SETTINGS_TEMPLATE = """
         box-shadow: inset 0 0 0 1px rgba(135, 214, 255, 0.12);
       }
       .workspace {
-        padding: 1.25rem 1.25rem 1.35rem;
+        padding: 1.12rem 1.12rem 1.2rem;
       }
       .workspace.is-hidden {
         display: none;
@@ -5162,7 +5187,7 @@ SETTINGS_TEMPLATE = """
       }
       .workspace-grid {
         display: grid;
-        grid-template-columns: minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1.55fr) minmax(18rem, 1fr);
         gap: 1rem;
         align-items: start;
       }
@@ -5176,7 +5201,7 @@ SETTINGS_TEMPLATE = """
         border: 1px solid var(--line);
         border-radius: 14px;
         background: var(--surface);
-        padding: 1.05rem;
+        padding: 1rem;
         min-width: 0;
         overflow: hidden;
       }
@@ -5299,7 +5324,7 @@ SETTINGS_TEMPLATE = """
         border-radius: 12px;
         border: 1px solid var(--line);
         background: var(--surface-2);
-        padding: 0.8rem;
+        padding: 0.74rem;
         overflow: hidden;
       }
       .schedule-cell {
@@ -5426,6 +5451,7 @@ SETTINGS_TEMPLATE = """
         <section
           class="panel workspace {% if host.room_slug != selected_room_slug %}is-hidden{% endif %}"
           data-room-panel="{{ host.room_slug }}"
+          data-host-slug="{{ host.slug }}"
         >
         <form method="post" action="{{ url_for('admin_update_host', slug=host.slug) }}">
           <input type="hidden" name="manual_mode" value="{{ host.manual_mode }}">
@@ -5448,19 +5474,16 @@ SETTINGS_TEMPLATE = """
               <section class="block">
                 <div class="block-head">
                   <strong>Current input</strong>
-                  <p>{{ host.current_device or "Waiting for the laptop agent" }}</p>
+                  <p data-current-device>{{ host.current_device or "Waiting for the laptop agent" }}</p>
                 </div>
-                {% if host.known_devices %}
-                <div class="device-list">
+                <div class="device-list {% if not host.known_devices %}is-hidden{% endif %}" data-known-device-list>
                   {% for device in host.known_devices %}
                   <span class="device-chip">{{ device }}</span>
                   {% endfor %}
                 </div>
-                {% else %}
-                <div class="input-empty">
+                <div class="input-empty {% if host.known_devices %}is-hidden{% endif %}" data-known-device-empty>
                   <p class="field-note">The laptop agent has not reported its inputs yet. This list updates automatically when it checks in.</p>
                 </div>
-                {% endif %}
               </section>
 
               <section class="block">
@@ -5558,11 +5581,11 @@ SETTINGS_TEMPLATE = """
                   <strong>Input order</strong>
                   <p>The agent uses the first available device in this order.</p>
                 </div>
-                <div class="order-list">
+                <div class="order-list" data-order-list>
                   {% for slot in host.device_slots %}
                   <label class="order-row">
                     <span>{{ loop.index }}{% if loop.index == 1 %}st{% elif loop.index == 2 %}nd{% elif loop.index == 3 %}rd{% else %}th{% endif %} choice</span>
-                    <select name="device_order">
+                    <select name="device_order" data-order-select data-slot-index="{{ loop.index0 }}">
                       <option value="">No preference</option>
                       {% for device in host.device_options %}
                       <option value="{{ device }}" {% if slot == device %}selected{% endif %}>{{ device }}</option>
@@ -5590,6 +5613,16 @@ SETTINGS_TEMPLATE = """
           const shellId = "settings-shell";
           let dirty = false;
           let refreshInFlight = false;
+          let runtimeRefreshInFlight = false;
+
+          function escapeHtml(value) {
+            return String(value ?? "")
+              .replaceAll("&", "&amp;")
+              .replaceAll("<", "&lt;")
+              .replaceAll(">", "&gt;")
+              .replaceAll('"', "&quot;")
+              .replaceAll("'", "&#39;");
+          }
 
           function selectedRoomSlug() {
             const activeTab = document.querySelector("[data-room-tab].is-active");
@@ -5699,6 +5732,65 @@ SETTINGS_TEMPLATE = """
             document.querySelectorAll("form").forEach(bindScheduleForm);
           }
 
+          function renderDeviceChips(devices) {
+            return devices.map((device) => `<span class="device-chip">${escapeHtml(device)}</span>`).join("");
+          }
+
+          function renderOrderOptions(devices, selectedValue) {
+            const selected = String(selectedValue || "");
+            const options = ['<option value="">No preference</option>'];
+            devices.forEach((device) => {
+              const value = String(device || "");
+              if (!value) {
+                return;
+              }
+              options.push(
+                `<option value="${escapeHtml(value)}"${selected === value ? " selected" : ""}>${escapeHtml(value)}</option>`
+              );
+            });
+            if (selected && !devices.includes(selected)) {
+              options.push(
+                `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)} (Unavailable)</option>`
+              );
+            }
+            return options.join("");
+          }
+
+          function updateWorkspaceRuntime(host) {
+            const workspace = document.querySelector(`[data-room-panel="${host.room_slug}"]`);
+            if (!workspace) {
+              return;
+            }
+
+            const currentDevice = workspace.querySelector("[data-current-device]");
+            if (currentDevice) {
+              currentDevice.textContent = host.current_device || "Waiting for the laptop agent";
+            }
+
+            const knownDeviceList = workspace.querySelector("[data-known-device-list]");
+            const knownDeviceEmpty = workspace.querySelector("[data-known-device-empty]");
+            if (knownDeviceList && knownDeviceEmpty) {
+              if (host.known_devices.length) {
+                knownDeviceList.innerHTML = renderDeviceChips(host.known_devices);
+                knownDeviceList.classList.remove("is-hidden");
+                knownDeviceEmpty.classList.add("is-hidden");
+              } else {
+                knownDeviceList.innerHTML = "";
+                knownDeviceList.classList.add("is-hidden");
+                knownDeviceEmpty.classList.remove("is-hidden");
+              }
+            }
+
+            const selects = [...workspace.querySelectorAll("[data-order-select]")];
+            selects.forEach((select) => {
+              const currentValue = select.value;
+              select.innerHTML = renderOrderOptions(host.device_options, currentValue);
+              if (currentValue && [...select.options].some((option) => option.value === currentValue)) {
+                select.value = currentValue;
+              }
+            });
+          }
+
           function clearFlashQuery() {
             const url = new URL(window.location.href);
             if (!url.searchParams.has("message") && !url.searchParams.has("error")) {
@@ -5756,12 +5848,36 @@ SETTINGS_TEMPLATE = """
             }
           }
 
+          async function refreshRuntime() {
+            if (runtimeRefreshInFlight || document.hidden) {
+              return;
+            }
+            runtimeRefreshInFlight = true;
+            try {
+              const response = await fetch(`{{ url_for('admin_runtime') }}?_ts=${Date.now()}`, {
+                cache: "no-store",
+              });
+              if (!response.ok) {
+                return;
+              }
+              const payload = await response.json();
+              (payload.hosts || []).forEach(updateWorkspaceRuntime);
+            } catch (error) {
+              /* ignore transient refresh issues */
+            } finally {
+              runtimeRefreshInFlight = false;
+            }
+          }
+
           bindTabs();
           bindWorkspace();
           clearFlashQuery();
-          window.setInterval(refreshSettings, 750);
+          refreshRuntime();
+          window.setInterval(refreshRuntime, 1000);
+          window.setInterval(refreshSettings, 3000);
           document.addEventListener("visibilitychange", () => {
             if (!document.hidden) {
+              refreshRuntime();
               refreshSettings();
             }
           });

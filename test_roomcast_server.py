@@ -1,5 +1,6 @@
 import os
 import queue
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +134,65 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertTrue(schedules_by_day["SAT"]["enabled"])
         self.assertFalse(schedules_by_day["MON"]["enabled"])
         self.assertIn(b"Updated hp-pavilion-14m-ba1xx", response.data)
+
+    def test_admin_runtime_endpoint_reports_live_devices(self):
+        self.client.post(
+            "/admin/login",
+            data={"password": "test-password"},
+            follow_redirects=True,
+        )
+        host = self.app.roomcast_store.get_host("hp-pavilion-14m-ba1xx", include_secret=True)
+        self.client.post(
+            "/api/source/heartbeat",
+            json={
+                "host_slug": host["slug"],
+                "token": host["heartbeat_token"],
+                "devices": ["Scarlett Solo 4th Gen", "Stereo Mix"],
+                "current_device": "Scarlett Solo 4th Gen",
+                "is_ingesting": False,
+                "last_error": "",
+            },
+        )
+
+        response = self.client.get("/api/admin/runtime")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        host_payload = next(item for item in payload["hosts"] if item["room_slug"] == "meeting-hall")
+        self.assertTrue(host_payload["source_online"])
+        self.assertEqual(host_payload["current_device"], "Scarlett Solo 4th Gen")
+        self.assertIn("Stereo Mix", host_payload["known_devices"])
+
+    def test_admin_runtime_masks_stale_host_devices(self):
+        self.client.post(
+            "/admin/login",
+            data={"password": "test-password"},
+            follow_redirects=True,
+        )
+        host = self.app.roomcast_store.get_host("hp-pavilion-14m-ba1xx", include_secret=True)
+        self.client.post(
+            "/api/source/heartbeat",
+            json={
+                "host_slug": host["slug"],
+                "token": host["heartbeat_token"],
+                "devices": ["Scarlett Solo 4th Gen"],
+                "current_device": "Scarlett Solo 4th Gen",
+                "is_ingesting": True,
+                "last_error": "",
+            },
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE source_runtime SET last_seen_at = ? WHERE host_slug = ?",
+                ("2020-01-01T00:00:00+00:00", "hp-pavilion-14m-ba1xx"),
+            )
+
+        response = self.client.get("/api/admin/runtime")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        host_payload = next(item for item in payload["hosts"] if item["room_slug"] == "meeting-hall")
+        self.assertFalse(host_payload["source_online"])
+        self.assertEqual(host_payload["current_device"], "")
+        self.assertEqual(host_payload["known_devices"], [])
 
     def test_source_heartbeat_returns_ingest_url(self):
         host = self.app.roomcast_store.get_host("hp-pavilion-14m-ba1xx", include_secret=True)
