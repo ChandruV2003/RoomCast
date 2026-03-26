@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import os
 import queue
 import sqlite3
@@ -24,6 +26,7 @@ class RoomCastServerTests(unittest.TestCase):
                 "SESSION_COOKIE_SECURE": False,
                 "ROOMCAST_ADMIN_PASSWORD": "test-password",
                 "ROOMCAST_TWILIO_WEBHOOK_TOKEN": "twilio-test-token",
+                "ROOMCAST_TELNYX_WEBHOOK_TOKEN": "telnyx-test-token",
                 "ROOMCAST_TELEPHONY_SECRET": "telephony-test-secret",
             }
         )
@@ -246,7 +249,50 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertEqual(connect.status_code, 200)
         self.assertIn(b"<Play>", connect.data)
         self.assertIn(b"/telephony/stream/", connect.data)
+        self.assertIn(b".wav", connect.data)
         self.assertIn(b"%2B19735551212", connect.data)
+
+    def test_telnyx_voice_returns_gather_then_stream_url(self):
+        gather = self.client.post("/telephony/telnyx/telnyx-test-token/voice")
+        self.assertEqual(gather.status_code, 200)
+        self.assertIn(b"<Gather", gather.data)
+
+        connect = self.client.post(
+            "/telephony/telnyx/telnyx-test-token/voice",
+            data={"Digits": "7070", "CallerId": "+19735550000"},
+        )
+        self.assertEqual(connect.status_code, 200)
+        self.assertIn(b"<Play>", connect.data)
+        self.assertIn(b"/telephony/stream/", connect.data)
+        self.assertIn(b".wav", connect.data)
+        self.assertIn(b"%2B19735550000", connect.data)
+
+    def test_telephony_stream_uses_phone_wav_profile(self):
+        app = create_app(
+            {
+                "TESTING": True,
+                "ROOMCAST_DB_PATH": str(Path(self.tempdir.name) / "phone-roomcast.db"),
+                "SECRET_KEY": "test-secret",
+                "SESSION_COOKIE_SECURE": False,
+                "ROOMCAST_STREAM_PROFILE": "wav_pcm24",
+                "ROOMCAST_TELEPHONY_SECRET": "telephony-test-secret",
+            }
+        )
+        client = app.test_client()
+        room_slug = "meeting-hall"
+        exp = "9999999999"
+        sig = hmac.new(
+            b"telephony-test-secret",
+            f"{room_slug}:{exp}:Phone caller:phone".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        response = client.get(
+            f"/telephony/stream/{room_slug}.wav?exp={exp}&sig={sig}&label=Phone%20caller&channel=phone",
+            buffered=False,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "audio/wav")
+        self.assertEqual(next(response.response)[:4], b"RIFF")
 
     def test_admin_report_download_returns_listener_rows(self):
         self.client.post(

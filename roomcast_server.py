@@ -48,6 +48,12 @@ STREAM_PROFILES = {
         "bits_per_sample": 24,
     },
 }
+TELEPHONY_STREAM_PROFILE = {
+    "mimetype": "audio/wav",
+    "channels": 1,
+    "sample_rate_hz": 8000,
+    "bits_per_sample": 16,
+}
 ROOM_ALIASES = {
     "study-room": "Room A",
     "meeting-hall": "Room B",
@@ -85,6 +91,53 @@ def _wav_stream_header(*, channels: int, sample_rate_hz: int, bits_per_sample: i
         b"data",
         placeholder_size,
     )
+
+
+def _pcm24le_to_int(sample: bytes) -> int:
+    value = sample[0] | (sample[1] << 8) | (sample[2] << 16)
+    if value & 0x800000:
+        value -= 1 << 24
+    return value
+
+
+class TelephonyPcmTranscoder:
+    """Convert live 24-bit PCM frames into a phone-friendly mono WAV stream."""
+
+    def __init__(self, *, source_channels: int, source_rate_hz: int, bits_per_sample: int):
+        self.source_channels = max(1, int(source_channels or 1))
+        self.source_rate_hz = max(8000, int(source_rate_hz or 48000))
+        self.bits_per_sample = max(16, int(bits_per_sample or 24))
+        self._bytes_per_sample = max(1, self.bits_per_sample // 8)
+        self._frame_width = self.source_channels * self._bytes_per_sample
+        self._carry = b""
+        self._sample_accumulator = 0
+
+    def transcode(self, chunk: bytes) -> bytes:
+        if not chunk:
+            return b""
+        if self.bits_per_sample != 24:
+            return chunk
+
+        data = self._carry + chunk
+        usable = len(data) - (len(data) % self._frame_width)
+        self._carry = data[usable:]
+        output = bytearray()
+        for offset in range(0, usable, self._frame_width):
+            frame = data[offset:offset + self._frame_width]
+            self._sample_accumulator += TELEPHONY_STREAM_PROFILE["sample_rate_hz"]
+            if self._sample_accumulator < self.source_rate_hz:
+                continue
+            self._sample_accumulator -= self.source_rate_hz
+
+            frame_samples = []
+            for channel_index in range(self.source_channels):
+                start = channel_index * self._bytes_per_sample
+                stop = start + self._bytes_per_sample
+                frame_samples.append(_pcm24le_to_int(frame[start:stop]))
+            mixed = int(sum(frame_samples) / len(frame_samples))
+            pcm16 = max(-32768, min(32767, mixed >> 8))
+            output.extend(struct.pack("<h", pcm16))
+        return bytes(output)
 
 
 @dataclass
@@ -212,6 +265,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_ADMIN_PASSWORD=os.getenv("ROOMCAST_ADMIN_PASSWORD", ""),
         ROOMCAST_TELEPHONY_SECRET=os.getenv("ROOMCAST_TELEPHONY_SECRET", ""),
         ROOMCAST_TWILIO_WEBHOOK_TOKEN=os.getenv("ROOMCAST_TWILIO_WEBHOOK_TOKEN", ""),
+        ROOMCAST_TELNYX_WEBHOOK_TOKEN=os.getenv("ROOMCAST_TELNYX_WEBHOOK_TOKEN", ""),
         ROOMCAST_GEOLOOKUP_URL=os.getenv("ROOMCAST_GEOLOOKUP_URL", "https://ipwho.is/{ip}"),
     )
     if test_config:
@@ -405,7 +459,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     ) -> str:
         expires_at = int(time.time()) + expires_in
         signature = _sign_telephony_stream(room_slug, expires_at, participant_label, channel)
-        return url_for(
+        stream_url = url_for(
             "telephony_stream",
             room_slug=room_slug,
             exp=expires_at,
@@ -414,6 +468,9 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             channel=channel,
             _external=True,
         )
+        if stream_url.endswith(".mp3") or ".mp3?" in stream_url:
+            stream_url = stream_url.replace(".mp3", ".wav", 1)
+        return stream_url
 
     def _telephony_stream_is_valid(room_slug: str, expires_at: str, signature: str, participant_label: str, channel: str) -> bool:
         try:
@@ -424,6 +481,60 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             return False
         expected = _sign_telephony_stream(room_slug, expires, participant_label, channel)
         return hmac.compare_digest(expected, signature or "")
+
+    def _telephony_stream_response(stream_factory, snapshot: dict | None = None):
+        source_descriptor = _stream_descriptor(snapshot)
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+
+        def _stream():
+            yield _wav_stream_header(
+                channels=TELEPHONY_STREAM_PROFILE["channels"],
+                sample_rate_hz=TELEPHONY_STREAM_PROFILE["sample_rate_hz"],
+                bits_per_sample=TELEPHONY_STREAM_PROFILE["bits_per_sample"],
+            )
+            transcoder = TelephonyPcmTranscoder(
+                source_channels=source_descriptor.get("channels", 1),
+                source_rate_hz=source_descriptor.get("sample_rate_hz", 48000),
+                bits_per_sample=source_descriptor.get("bits_per_sample", 24),
+            )
+            for chunk in stream_factory():
+                if not chunk:
+                    continue
+                if source_descriptor["mimetype"] == "audio/wav":
+                    converted = transcoder.transcode(chunk)
+                    if converted:
+                        yield converted
+                else:
+                    yield chunk
+
+        return Response(_stream(), mimetype=TELEPHONY_STREAM_PROFILE["mimetype"], headers=headers)
+
+    def _voice_gather_xml(action_url: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="dtmf" numDigits="4" timeout="6" action="{escape(action_url)}" method="POST">
+    <Say>Enter pin.</Say>
+  </Gather>
+  <Say>Goodbye.</Say>
+</Response>"""
+
+    def _voice_invalid_pin_xml(retry_url: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Pin not accepted.</Say>
+  <Redirect method="POST">{escape(retry_url)}</Redirect>
+</Response>"""
+
+    def _voice_connect_xml(stream_url: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Connecting.</Say>
+  <Play>{escape(stream_url)}</Play>
+</Response>"""
 
     def _is_admin() -> bool:
         return bool(session.get("roomcast_admin"))
@@ -1289,11 +1400,15 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                     roomcast_store.end_listener_session(listener_session_id)
         return _audio_stream_response(_stream, snapshot)
 
+    @app.get("/telephony/stream/<room_slug>.wav")
     @app.get("/telephony/stream/<room_slug>.mp3")
     def telephony_stream(room_slug: str):
         room = roomcast_store.get_room(room_slug)
         if not room or not room["enabled"]:
             return jsonify({"error": "unknown room"}), 404
+        snapshot = _room_snapshot(room_slug)
+        if _stream_descriptor(snapshot)["mimetype"] != "audio/wav":
+            return jsonify({"error": "telephony requires wav profile"}), 503
 
         expires_at = request.args.get("exp", "")
         signature = request.args.get("sig", "")
@@ -1317,7 +1432,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 yield from stream_hub.listen(room_slug)
             finally:
                 roomcast_store.end_listener_session(listener_session_id)
-        return _audio_stream_response(_stream, _room_snapshot(room_slug))
+        return _telephony_stream_response(_stream, snapshot)
 
     @app.route("/telephony/twilio/<webhook_token>/voice", methods=["GET", "POST"])
     def twilio_voice(webhook_token: str):
@@ -1328,33 +1443,40 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         digits = (request.values.get("Digits") or "").strip()
         if not digits:
             action_url = url_for("twilio_voice", webhook_token=webhook_token, _external=True)
-            body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="dtmf" numDigits="4" timeout="6" action="{escape(action_url)}" method="POST">
-    <Say>Enter pin.</Say>
-  </Gather>
-  <Say>Goodbye.</Say>
-</Response>"""
-            return Response(body, mimetype="text/xml")
+            return Response(_voice_gather_xml(action_url), mimetype="text/xml")
 
         snapshot = _resolve_public_room(digits)
         if not snapshot:
             retry_url = url_for("twilio_voice", webhook_token=webhook_token, _external=True)
-            body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Pin not accepted.</Say>
-  <Redirect method="POST">{escape(retry_url)}</Redirect>
-</Response>"""
-            return Response(body, mimetype="text/xml")
+            return Response(_voice_invalid_pin_xml(retry_url), mimetype="text/xml")
 
         participant_label = (request.values.get("From") or "Phone caller").strip() or "Phone caller"
         stream_url = _telephony_stream_url(snapshot["slug"], participant_label=participant_label)
-        body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Connecting.</Say>
-  <Play>{escape(stream_url)}</Play>
-</Response>"""
-        return Response(body, mimetype="text/xml")
+        return Response(_voice_connect_xml(stream_url), mimetype="text/xml")
+
+    @app.route("/telephony/telnyx/<webhook_token>/voice", methods=["GET", "POST"])
+    def telnyx_voice(webhook_token: str):
+        expected = app.config.get("ROOMCAST_TELNYX_WEBHOOK_TOKEN", "")
+        if not expected or not hmac.compare_digest(webhook_token, expected):
+            return jsonify({"error": "not found"}), 404
+
+        digits = (request.values.get("Digits") or "").strip()
+        if not digits:
+            action_url = url_for("telnyx_voice", webhook_token=webhook_token, _external=True)
+            return Response(_voice_gather_xml(action_url), mimetype="text/xml")
+
+        snapshot = _resolve_public_room(digits)
+        if not snapshot:
+            retry_url = url_for("telnyx_voice", webhook_token=webhook_token, _external=True)
+            return Response(_voice_invalid_pin_xml(retry_url), mimetype="text/xml")
+
+        participant_label = (
+            request.values.get("From")
+            or request.values.get("CallerId")
+            or "Phone caller"
+        ).strip() or "Phone caller"
+        stream_url = _telephony_stream_url(snapshot["slug"], participant_label=participant_label)
+        return Response(_voice_connect_xml(stream_url), mimetype="text/xml")
 
     @app.post("/api/source/heartbeat")
     def source_heartbeat():
