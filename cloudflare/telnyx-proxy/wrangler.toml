@@ -1,0 +1,7 @@
+name = "roomcast-telnyx-proxy"
+main = "src/index.js"
+compatibility_date = "2026-03-31"
+workers_dev = true
+
+[vars]
+ROOMCAST_TELNYX_TARGET_URL = "https://ntcnas.myftp.org/webcall/telephony/telnyx/k-sk52WkbkIx_fvjEX7nV2eGQGkMRZma/voice"

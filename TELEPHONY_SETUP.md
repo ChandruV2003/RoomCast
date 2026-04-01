@@ -50,3 +50,11 @@ Call flow is the same as Twilio:
 - The phone path uses a telephony-specific WAV stream instead of the browser listener stream.
 - The telephony stream is downsampled to mono `8 kHz / 16-bit` WAV for PSTN compatibility.
 - The public listener PIN remains the same shared PIN used on the web side.
+
+## Cloudflare workaround for Telnyx domain validation
+
+If Telnyx rejects `ntcnas.myftp.org` as a webhook hostname, deploy the bundled
+Cloudflare Worker in `cloudflare/telnyx-proxy`.
+
+After deployment, use the Worker hostname as the Telnyx voice webhook URL
+instead of the direct `myftp.org` URL.
