@@ -9,10 +9,11 @@ param(
     [string]$Token,
 
     [string]$RepoPath = (Split-Path -Parent $PSCommandPath),
-    [string]$TaskName = "WebCall Source Agent",
-    [string]$PythonLauncher = "py",
-    [string]$PythonSelector = "",
-    [int]$PollIntervalSeconds = 1
+[string]$TaskName = "WebCall Source Agent",
+[string]$PythonLauncher = "py",
+[string]$PythonSelector = "",
+[string]$PythonExecutable = "",
+[int]$PollIntervalSeconds = 1
 )
 
 $resolvedRepo = (Resolve-Path $RepoPath).Path
@@ -36,9 +37,20 @@ if (-not $resolvedPythonSelector) {
     throw "Could not find a usable Python launcher target via '$PythonLauncher'. Pass -PythonSelector explicitly."
 }
 
-$agentLaunch = @(
-    "& $PythonLauncher"
-    $resolvedPythonSelector
+$resolvedPythonExecutable = $PythonExecutable
+if (-not $resolvedPythonExecutable) {
+    $resolvedPythonExecutable = (& $PythonLauncher $resolvedPythonSelector -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1).Trim()
+}
+
+if (-not $resolvedPythonExecutable) {
+    throw "Could not resolve a Python executable via '$PythonLauncher $resolvedPythonSelector'. Pass -PythonExecutable explicitly."
+}
+
+if (-not (Test-Path $resolvedPythonExecutable)) {
+    throw "Resolved Python executable was not found: $resolvedPythonExecutable"
+}
+
+$agentArgs = @(
     "'$agentScript'"
     "--server-url '$ServerUrl'"
     "--host-slug '$HostSlug'"
@@ -46,17 +58,12 @@ $agentLaunch = @(
     "--poll-interval '$PollIntervalSeconds'"
 ) -join " "
 
-$command = @(
-    "Set-Location '$resolvedRepo'"
-    $agentLaunch
-) -join "; "
-
 $runtimeDir = Join-Path $resolvedRepo "runtime"
 $lockPath = Join-Path $runtimeDir "$HostSlug-roomcast-agent.lock"
 
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NoProfile -WindowStyle Hidden -Command `$ErrorActionPreference = 'Stop'; $command"
+    -Argument "-NoProfile -WindowStyle Hidden -Command `$ErrorActionPreference = 'Stop'; Set-Location '$resolvedRepo'; & '$resolvedPythonExecutable' $agentArgs"
 
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
