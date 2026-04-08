@@ -261,6 +261,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_DB_PATH=os.getenv("ROOMCAST_DB_PATH"),
         ROOMCAST_PUBLIC_NAME=os.getenv("ROOMCAST_PUBLIC_NAME", "NTC Newark WebCall"),
         ROOMCAST_LISTENER_NAME=os.getenv("ROOMCAST_LISTENER_NAME", "NTC Newark WebCall"),
+        ROOMCAST_TELEPHONY_PUBLIC_BASE_URL=os.getenv("ROOMCAST_TELEPHONY_PUBLIC_BASE_URL", "https://ntcnas.myftp.org"),
         ROOMCAST_STREAM_PROFILE=os.getenv("ROOMCAST_STREAM_PROFILE", "mp3"),
         ROOMCAST_ADMIN_PASSWORD=os.getenv("ROOMCAST_ADMIN_PASSWORD", ""),
         ROOMCAST_TELEPHONY_SECRET=os.getenv("ROOMCAST_TELEPHONY_SECRET", ""),
@@ -446,6 +447,10 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     def _telephony_secret() -> str:
         return app.config.get("ROOMCAST_TELEPHONY_SECRET") or app.config["SECRET_KEY"]
 
+    def _telephony_public_url(endpoint: str, **values) -> str:
+        base = (app.config.get("ROOMCAST_TELEPHONY_PUBLIC_BASE_URL") or request.host_url).rstrip("/")
+        return f"{base}{url_for(endpoint, **values)}"
+
     def _sign_telephony_stream(room_slug: str, expires_at: int, participant_label: str, channel: str) -> str:
         payload = f"{room_slug}:{expires_at}:{participant_label}:{channel}".encode("utf-8")
         return hmac.new(_telephony_secret().encode("utf-8"), payload, hashlib.sha256).hexdigest()
@@ -459,14 +464,13 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     ) -> str:
         expires_at = int(time.time()) + expires_in
         signature = _sign_telephony_stream(room_slug, expires_at, participant_label, channel)
-        stream_url = url_for(
+        stream_url = _telephony_public_url(
             "telephony_stream",
             room_slug=room_slug,
             exp=expires_at,
             sig=signature,
             label=participant_label,
             channel=channel,
-            _external=True,
         )
         if stream_url.endswith(".mp3") or ".mp3?" in stream_url:
             stream_url = stream_url.replace(".mp3", ".wav", 1)
@@ -1442,12 +1446,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
         digits = (request.values.get("Digits") or "").strip()
         if not digits:
-            action_url = url_for("twilio_voice", webhook_token=webhook_token, _external=True)
+            action_url = _telephony_public_url("twilio_voice", webhook_token=webhook_token)
             return Response(_voice_gather_xml(action_url), mimetype="text/xml")
 
         snapshot = _resolve_public_room(digits)
         if not snapshot:
-            retry_url = url_for("twilio_voice", webhook_token=webhook_token, _external=True)
+            retry_url = _telephony_public_url("twilio_voice", webhook_token=webhook_token)
             return Response(_voice_invalid_pin_xml(retry_url), mimetype="text/xml")
 
         participant_label = (request.values.get("From") or "Phone caller").strip() or "Phone caller"
@@ -1462,12 +1466,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
         digits = (request.values.get("Digits") or "").strip()
         if not digits:
-            action_url = url_for("telnyx_voice", webhook_token=webhook_token, _external=True)
+            action_url = _telephony_public_url("telnyx_voice", webhook_token=webhook_token)
             return Response(_voice_gather_xml(action_url), mimetype="text/xml")
 
         snapshot = _resolve_public_room(digits)
         if not snapshot:
-            retry_url = url_for("telnyx_voice", webhook_token=webhook_token, _external=True)
+            retry_url = _telephony_public_url("telnyx_voice", webhook_token=webhook_token)
             return Response(_voice_invalid_pin_xml(retry_url), mimetype="text/xml")
 
         participant_label = (
