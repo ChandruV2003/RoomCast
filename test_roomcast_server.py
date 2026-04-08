@@ -214,7 +214,7 @@ class RoomCastServerTests(unittest.TestCase):
         payload = response.get_json()
         self.assertIn("/api/source/ingest/hp-pavilion-14m-ba1xx", payload["ingest_url"])
         self.assertIn("device_order", payload)
-        self.assertEqual(payload["capture_mode"], "mono")
+        self.assertEqual(payload["capture_mode"], "stereo")
         self.assertEqual(payload["stream_profile"], "mp3")
 
     def test_listen_live_uses_wav_mimetype_when_configured(self):

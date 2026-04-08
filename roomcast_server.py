@@ -517,7 +517,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="dtmf" numDigits="4" timeout="6" action="{escape(action_url)}" method="POST">
-    <Say>Enter pin.</Say>
+    <Say>Welcome to NTC Newark WebCall. Please enter your pin now.</Say>
   </Gather>
   <Say>Goodbye.</Say>
 </Response>"""
@@ -525,14 +525,14 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     def _voice_invalid_pin_xml(retry_url: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Pin not accepted.</Say>
+  <Say>That pin was not accepted. Please try again.</Say>
   <Redirect method="POST">{escape(retry_url)}</Redirect>
 </Response>"""
 
     def _voice_connect_xml(stream_url: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Connecting.</Say>
+  <Say>Connecting you now.</Say>
   <Play>{escape(stream_url)}</Play>
 </Response>"""
 

@@ -11,7 +11,7 @@ _DEFAULT_HOSTS = [
         "room": "Tarry Meeting Hall",
         "enabled": True,
         "manual_mode": "auto",
-        "capture_mode": "mono",
+        "capture_mode": "stereo",
         "notes": "Primary Saturday meeting laptop.",
         "timezone": DEFAULT_TIMEZONE,
         "schedules": [
@@ -29,7 +29,7 @@ _DEFAULT_HOSTS = [
         "room": "Other room / Bible study room",
         "enabled": True,
         "manual_mode": "auto",
-        "capture_mode": "mono-left",
+        "capture_mode": "stereo",
         "notes": "Used for Sunday meetings and Wednesday Bible study.",
         "timezone": DEFAULT_TIMEZONE,
         "schedules": [

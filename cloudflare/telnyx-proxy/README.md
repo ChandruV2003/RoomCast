@@ -19,9 +19,11 @@ another domain.
 2. Go to `Workers & Pages`.
 3. Create a new Worker named `roomcast-telnyx-proxy`.
 4. Replace the default worker code with the contents of `src/index.js`.
-5. Add a Worker variable:
+5. Add Worker variables:
    - `ROOMCAST_TELNYX_TARGET_URL`
    - `https://ntcnas.myftp.org/webcall/telephony/telnyx/k-sk52WkbkIx_fvjEX7nV2eGQGkMRZma/voice`
+   - `ROOMCAST_PUBLIC_BASE_URL`
+   - `https://ntcnas.myftp.org`
 6. Deploy the Worker.
 7. Copy the resulting `https://<worker>.workers.dev` URL.
 
@@ -48,4 +50,9 @@ In the Telnyx TeXML application:
 - `Webhook URL Method`: `Custom URL`
 - `Webhook URL`: your `workers.dev` URL
 
-The worker forwards the POST body and query string directly to RoomCast.
+The worker forwards:
+
+- the root webhook request to the Telnyx voice endpoint
+- any follow-up `/webcall/...` requests back to the public RoomCast host
+
+That lets Telnyx fetch the signed phone-audio stream after the PIN succeeds.

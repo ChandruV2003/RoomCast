@@ -5,10 +5,17 @@
 
 export default {
   async fetch(request, env) {
-    const target = new URL(env.ROOMCAST_TELNYX_TARGET_URL);
     const incoming = new URL(request.url);
+    const telephonyTarget = new URL(env.ROOMCAST_TELNYX_TARGET_URL);
+    const originTarget = new URL(env.ROOMCAST_PUBLIC_BASE_URL || env.ROOMCAST_TELNYX_TARGET_URL);
+    const target =
+      incoming.pathname !== "/" && incoming.pathname !== ""
+        ? new URL(`${incoming.pathname}${incoming.search}`, originTarget)
+        : new URL(telephonyTarget.toString());
 
-    target.search = incoming.search;
+    if (incoming.pathname === "/" || incoming.pathname === "") {
+      target.search = incoming.search;
+    }
 
     const headers = new Headers(request.headers);
     headers.set("host", target.host);
