@@ -3,6 +3,7 @@ import hmac
 import os
 import queue
 import sqlite3
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,8 +16,9 @@ from roomcast_server import (
     INGEST_CHUNK_SIZE,
     LISTENER_QUEUE_MAXSIZE,
     RoomStreamHub,
+    TelephonyPcmTranscoder,
     _rtp_packet,
-    _rtp_payload_type_for_codec,
+    _telnyx_rtp_payload_type,
     create_app,
 )
 
@@ -47,20 +49,36 @@ class RoomCastServerTests(unittest.TestCase):
     def test_ingest_chunk_size_stays_aligned_for_pcm24_frames(self):
         self.assertEqual(INGEST_CHUNK_SIZE % 3, 0)
 
-    def test_telnyx_rtp_packet_uses_standard_pcmu_payload_type(self):
+    def test_telephony_transcoder_downmixes_and_resamples_pcm24(self):
+        transcoder = TelephonyPcmTranscoder(
+            source_channels=2,
+            source_rate_hz=48000,
+            bits_per_sample=24,
+            output_rate_hz=8000,
+        )
+        left = (600000).to_bytes(3, "little", signed=True)
+        right = (300000).to_bytes(3, "little", signed=True)
+        stereo_payload = (left + right) * 480
+        converted = transcoder.transcode(stereo_payload)
+        self.assertGreater(len(converted), 0)
+        self.assertEqual(len(converted) % 2, 0)
+        self.assertNotEqual(converted, b"\x00" * len(converted))
+
+    def test_rtp_packet_uses_standard_pcmu_payload_type(self):
         packet = _rtp_packet(
             b"\xff" * 160,
-            payload_type=_rtp_payload_type_for_codec("PCMU"),
-            sequence_number=321,
-            timestamp=123456,
-            ssrc=7890,
+            payload_type=_telnyx_rtp_payload_type("PCMU"),
+            sequence_number=1234,
+            timestamp=5678,
+            ssrc=9012,
         )
-        self.assertEqual(packet[0], 0x80)
-        self.assertEqual(packet[1] & 0x7F, 0)
-        self.assertEqual(int.from_bytes(packet[2:4], "big"), 321)
-        self.assertEqual(int.from_bytes(packet[4:8], "big"), 123456)
-        self.assertEqual(int.from_bytes(packet[8:12], "big"), 7890)
-        self.assertEqual(packet[12:], b"\xff" * 160)
+        version_and_flags, payload_info, sequence_number, timestamp, ssrc = struct.unpack("!BBHII", packet[:12])
+        self.assertEqual(version_and_flags >> 6, 2)
+        self.assertEqual(payload_info & 0x7F, 0)
+        self.assertEqual(sequence_number, 1234)
+        self.assertEqual(timestamp, 5678)
+        self.assertEqual(ssrc, 9012)
+        self.assertEqual(len(packet), 172)
 
     def test_join_flow_redirects_to_room_page(self):
         response = self.client.post(

@@ -31,6 +31,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from roomcast_store import RoomCastStore
 
+try:
+    import audioop  # type: ignore
+except ImportError:  # pragma: no cover - Python 3.13+ may not ship audioop
+    audioop = None
+
 
 LISTENER_QUEUE_MAXSIZE = 6
 # Keep ingest chunks aligned to 24-bit PCM frame boundaries so a listener can
@@ -145,6 +150,8 @@ def _linear16_to_pcmu_sample(sample: int) -> int:
 
 
 def _linear16le_to_pcmu(pcm_bytes: bytes) -> bytes:
+    if audioop is not None:
+        return audioop.lin2ulaw(pcm_bytes, 2)
     payload = bytearray()
     usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
     for offset in range(0, usable, 2):
@@ -173,6 +180,8 @@ def _linear16_to_pcma_sample(sample: int) -> int:
 
 
 def _linear16le_to_pcma(pcm_bytes: bytes) -> bytes:
+    if audioop is not None:
+        return audioop.lin2alaw(pcm_bytes, 2)
     payload = bytearray()
     usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
     for offset in range(0, usable, 2):
@@ -181,23 +190,35 @@ def _linear16le_to_pcma(pcm_bytes: bytes) -> bytes:
     return bytes(payload)
 
 
-def _rtp_payload_type_for_codec(codec: str) -> int:
-    normalized = (codec or "").strip().upper()
-    if normalized == "PCMU":
-        return 0
+def _telnyx_rtp_payload_type(codec: str) -> int:
+    normalized = (codec or "PCMU").strip().upper()
     if normalized == "PCMA":
         return 8
     if normalized == "G722":
         return 9
-    return 96
+    return 0
 
 
-def _rtp_packet(payload: bytes, *, payload_type: int, sequence_number: int, timestamp: int, ssrc: int, marker: bool = False) -> bytes:
-    first_byte = 0x80  # Version 2, no padding, no extension, no CSRCs
-    second_byte = payload_type & 0x7F
-    if marker:
-        second_byte |= 0x80
-    header = struct.pack("!BBHII", first_byte, second_byte, sequence_number & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
+def _rtp_packet(
+    payload: bytes,
+    *,
+    payload_type: int,
+    sequence_number: int,
+    timestamp: int,
+    ssrc: int,
+    marker: bool = False,
+) -> bytes:
+    version = 2
+    first_byte = version << 6
+    second_byte = (0x80 if marker else 0x00) | (payload_type & 0x7F)
+    header = struct.pack(
+        "!BBHII",
+        first_byte,
+        second_byte,
+        sequence_number & 0xFFFF,
+        timestamp & 0xFFFFFFFF,
+        ssrc & 0xFFFFFFFF,
+    )
     return header + payload
 
 
@@ -213,6 +234,7 @@ class TelephonyPcmTranscoder:
         self._frame_width = self.source_channels * self._bytes_per_sample
         self._carry = b""
         self._sample_accumulator = 0
+        self._rate_state = None
 
     def transcode(self, chunk: bytes) -> bytes:
         if not chunk:
@@ -221,9 +243,30 @@ class TelephonyPcmTranscoder:
         data = self._carry + chunk
         usable = len(data) - (len(data) % self._frame_width)
         self._carry = data[usable:]
+        if usable <= 0:
+            return b""
+
+        payload = data[:usable]
+
+        if audioop is not None and self.source_channels in (1, 2) and self._bytes_per_sample in (1, 2, 3, 4):
+            mono = payload
+            if self.source_channels == 2:
+                mono = audioop.tomono(payload, self._bytes_per_sample, 0.5, 0.5)
+            resampled, self._rate_state = audioop.ratecv(
+                mono,
+                self._bytes_per_sample,
+                1,
+                self.source_rate_hz,
+                self.output_rate_hz,
+                self._rate_state,
+            )
+            if self._bytes_per_sample != 2:
+                resampled = audioop.lin2lin(resampled, self._bytes_per_sample, 2)
+            return resampled
+
         output = bytearray()
         for offset in range(0, usable, self._frame_width):
-            frame = data[offset:offset + self._frame_width]
+            frame = payload[offset:offset + self._frame_width]
             self._sample_accumulator += self.output_rate_hz
             if self._sample_accumulator < self.source_rate_hz:
                 continue
@@ -241,6 +284,8 @@ class TelephonyPcmTranscoder:
                 else:
                     continue
                 frame_samples.append(sample_value)
+            if not frame_samples:
+                continue
             mixed = int(sum(frame_samples) / len(frame_samples))
             pcm16 = max(-32768, min(32767, mixed >> 8))
             output.extend(struct.pack("<h", pcm16))
@@ -280,7 +325,7 @@ class TelnyxStreamRuntime:
     stop_event: threading.Event = field(default_factory=threading.Event)
     sender_thread: threading.Thread | None = None
     stream_id: str = ""
-    rtp_sequence_number: int = field(default_factory=lambda: secrets.randbelow(65536))
+    rtp_sequence_number: int = field(default_factory=lambda: secrets.randbits(16))
     rtp_timestamp: int = field(default_factory=lambda: secrets.randbits(32))
     rtp_ssrc: int = field(default_factory=lambda: secrets.randbits(32))
 
@@ -548,22 +593,6 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         if codec == "PCMA":
             return _linear16le_to_pcma(pcm_frame)
         return _linear16le_to_pcmu(pcm_frame)
-
-    def _telnyx_stream_rtp_packet(pcm_frame: bytes, runtime: TelnyxStreamRuntime, *, marker: bool = False) -> bytes:
-        codec = (app.config.get("ROOMCAST_TELNYX_STREAM_CODEC") or "PCMU").strip().upper()
-        encoded_payload = _telnyx_stream_payload_from_pcm(pcm_frame)
-        sample_count = max(1, len(pcm_frame) // 2)
-        packet = _rtp_packet(
-            encoded_payload,
-            payload_type=_rtp_payload_type_for_codec(codec),
-            sequence_number=runtime.rtp_sequence_number,
-            timestamp=runtime.rtp_timestamp,
-            ssrc=runtime.rtp_ssrc,
-            marker=marker,
-        )
-        runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) % 65536
-        runtime.rtp_timestamp = (runtime.rtp_timestamp + sample_count) % (1 << 32)
-        return packet
 
     def _collect_telephony_segment(session_state: TelephonySessionState) -> tuple[bytes, bool]:
         session_state.last_access_at = time.time()
@@ -836,9 +865,11 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     def _send_telnyx_stream_audio(ws, session_state: TelephonySessionState, runtime: TelnyxStreamRuntime):
         snapshot = _room_snapshot(session_state.room_slug)
         descriptor = _stream_descriptor(snapshot)
+        codec = (app.config.get("ROOMCAST_TELNYX_STREAM_CODEC") or "PCMU").strip().upper()
         sample_rate = max(8000, int(app.config.get("ROOMCAST_TELNYX_STREAM_SAMPLE_RATE", 8000)))
         frame_pcm_bytes = _telnyx_stream_frame_bytes()
         silence_frame = b"\x00" * frame_pcm_bytes
+        rtp_payload_type = _telnyx_rtp_payload_type(codec)
         transcoder = TelephonyPcmTranscoder(
             source_channels=descriptor.get("channels", 1),
             source_rate_hz=descriptor.get("sample_rate_hz", 48000),
@@ -870,12 +901,30 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 while len(pcm_buffer) >= frame_pcm_bytes and not runtime.stop_event.is_set():
                     frame_pcm = bytes(pcm_buffer[:frame_pcm_bytes])
                     del pcm_buffer[:frame_pcm_bytes]
-                    payload = _telnyx_stream_rtp_packet(frame_pcm, runtime)
-                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
+                    payload = _telnyx_stream_payload_from_pcm(frame_pcm)
+                    packet = _rtp_packet(
+                        payload,
+                        payload_type=rtp_payload_type,
+                        sequence_number=runtime.rtp_sequence_number,
+                        timestamp=runtime.rtp_timestamp,
+                        ssrc=runtime.rtp_ssrc,
+                    )
+                    runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) & 0xFFFF
+                    runtime.rtp_timestamp = (runtime.rtp_timestamp + (len(frame_pcm) // 2)) & 0xFFFFFFFF
+                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(packet).decode("ascii")}}))
 
                 if not chunk and len(pcm_buffer) < frame_pcm_bytes and not runtime.stop_event.is_set():
-                    payload = _telnyx_stream_rtp_packet(silence_frame, runtime)
-                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
+                    payload = _telnyx_stream_payload_from_pcm(silence_frame)
+                    packet = _rtp_packet(
+                        payload,
+                        payload_type=rtp_payload_type,
+                        sequence_number=runtime.rtp_sequence_number,
+                        timestamp=runtime.rtp_timestamp,
+                        ssrc=runtime.rtp_ssrc,
+                    )
+                    runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) & 0xFFFF
+                    runtime.rtp_timestamp = (runtime.rtp_timestamp + (len(silence_frame) // 2)) & 0xFFFFFFFF
+                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(packet).decode("ascii")}}))
         except ConnectionClosed:
             _telephony_log("telnyx-stream-send-closed", session_id=session_state.session_id, stream_id=runtime.stream_id)
         except Exception as exc:
@@ -2080,6 +2129,16 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                         "telnyx-stream-dtmf",
                         session_id=session_id,
                         digit=((payload.get("dtmf") or {}).get("digit") or ""),
+                    )
+                    continue
+                if event == "error":
+                    details = payload.get("payload") or {}
+                    _telephony_log(
+                        "telnyx-stream-error-frame",
+                        session_id=session_id,
+                        code=details.get("code"),
+                        title=details.get("title"),
+                        detail=details.get("detail"),
                     )
                     continue
                 if event == "stop":

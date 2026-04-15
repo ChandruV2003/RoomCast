@@ -24,3 +24,31 @@ services:
       ROOMCAST_TELNYX_STREAM_FRAME_MS: ${ROOMCAST_TELNYX_STREAM_FRAME_MS:-20}
     volumes:
       - ./data:/app/data
+
+  roomcast-watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.roomcast
+    container_name: roomcast-watchdog
+    restart: unless-stopped
+    depends_on:
+      - roomcast
+    environment:
+      ROOMCAST_DB_PATH: ${ROOMCAST_DB_PATH:-/app/data/roomcast.db}
+      ROOMCAST_WATCHDOG_HEARTBEAT_STALE_SECONDS: ${ROOMCAST_WATCHDOG_HEARTBEAT_STALE_SECONDS:-45}
+      ROOMCAST_WATCHDOG_STARTUP_GRACE_SECONDS: ${ROOMCAST_WATCHDOG_STARTUP_GRACE_SECONDS:-25}
+    volumes:
+      - ./data:/app/data
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          python3 roomcast_watchdog.py \
+            --db-path "$${ROOMCAST_DB_PATH}" \
+            --heartbeat-stale-seconds "$${ROOMCAST_WATCHDOG_HEARTBEAT_STALE_SECONDS}" \
+            --startup-grace-seconds "$${ROOMCAST_WATCHDOG_STARTUP_GRACE_SECONDS}" \
+            --record-incidents \
+            --json || true
+          sleep 60
+        done

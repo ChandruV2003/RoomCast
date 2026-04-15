@@ -65,6 +65,18 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso8601_like(value: str | None):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.encode("utf-8")).hexdigest()
 
@@ -886,6 +898,46 @@ class RoomCastStore:
                     """,
                     (prior["room_slug"], host_slug, timestamp, "warn", last_error),
                 )
+
+    def record_incident(
+        self,
+        room_slug: str,
+        *,
+        host_slug: str | None = None,
+        severity: str = "warn",
+        message: str,
+        dedupe_window_seconds: int = 600,
+    ):
+        timestamp = _utc_now()
+        normalized_message = (message or "").strip()
+        with self._connect() as connection:
+            latest = connection.execute(
+                """
+                SELECT occurred_at
+                FROM meeting_incidents
+                WHERE room_slug = ?
+                  AND COALESCE(host_slug, '') = COALESCE(?, '')
+                  AND severity = ?
+                  AND message = ?
+                ORDER BY occurred_at DESC
+                LIMIT 1
+                """,
+                (room_slug, host_slug, severity, normalized_message),
+            ).fetchone()
+            if latest and dedupe_window_seconds > 0:
+                previous = _parse_iso8601_like(latest["occurred_at"])
+                if previous is not None:
+                    delta = datetime.now(timezone.utc) - previous
+                    if delta.total_seconds() < dedupe_window_seconds:
+                        return
+
+            connection.execute(
+                """
+                INSERT INTO meeting_incidents (room_slug, host_slug, occurred_at, severity, message)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (room_slug, host_slug, timestamp, severity, normalized_message),
+            )
 
     def sync_meeting_state(self, room_slug: str, *, active: bool, host_slug: str | None = None, trigger_mode: str = "system", actor: str = ""):
         timestamp = _utc_now()
