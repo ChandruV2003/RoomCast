@@ -11,7 +11,14 @@ from werkzeug.datastructures import MultiDict
 
 os.environ["ROOMCAST_DEFAULT_PIN"] = "7070"
 
-from roomcast_server import INGEST_CHUNK_SIZE, LISTENER_QUEUE_MAXSIZE, RoomStreamHub, create_app
+from roomcast_server import (
+    INGEST_CHUNK_SIZE,
+    LISTENER_QUEUE_MAXSIZE,
+    RoomStreamHub,
+    _rtp_packet,
+    _rtp_payload_type_for_codec,
+    create_app,
+)
 
 
 class RoomCastServerTests(unittest.TestCase):
@@ -39,6 +46,21 @@ class RoomCastServerTests(unittest.TestCase):
 
     def test_ingest_chunk_size_stays_aligned_for_pcm24_frames(self):
         self.assertEqual(INGEST_CHUNK_SIZE % 3, 0)
+
+    def test_telnyx_rtp_packet_uses_standard_pcmu_payload_type(self):
+        packet = _rtp_packet(
+            b"\xff" * 160,
+            payload_type=_rtp_payload_type_for_codec("PCMU"),
+            sequence_number=321,
+            timestamp=123456,
+            ssrc=7890,
+        )
+        self.assertEqual(packet[0], 0x80)
+        self.assertEqual(packet[1] & 0x7F, 0)
+        self.assertEqual(int.from_bytes(packet[2:4], "big"), 321)
+        self.assertEqual(int.from_bytes(packet[4:8], "big"), 123456)
+        self.assertEqual(int.from_bytes(packet[8:12], "big"), 7890)
+        self.assertEqual(packet[12:], b"\xff" * 160)
 
     def test_join_flow_redirects_to_room_page(self):
         response = self.client.post(

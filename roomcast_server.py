@@ -181,6 +181,26 @@ def _linear16le_to_pcma(pcm_bytes: bytes) -> bytes:
     return bytes(payload)
 
 
+def _rtp_payload_type_for_codec(codec: str) -> int:
+    normalized = (codec or "").strip().upper()
+    if normalized == "PCMU":
+        return 0
+    if normalized == "PCMA":
+        return 8
+    if normalized == "G722":
+        return 9
+    return 96
+
+
+def _rtp_packet(payload: bytes, *, payload_type: int, sequence_number: int, timestamp: int, ssrc: int, marker: bool = False) -> bytes:
+    first_byte = 0x80  # Version 2, no padding, no extension, no CSRCs
+    second_byte = payload_type & 0x7F
+    if marker:
+        second_byte |= 0x80
+    header = struct.pack("!BBHII", first_byte, second_byte, sequence_number & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
+    return header + payload
+
+
 class TelephonyPcmTranscoder:
     """Convert live PCM frames into a phone-friendly mono PCM16 stream."""
 
@@ -260,6 +280,9 @@ class TelnyxStreamRuntime:
     stop_event: threading.Event = field(default_factory=threading.Event)
     sender_thread: threading.Thread | None = None
     stream_id: str = ""
+    rtp_sequence_number: int = field(default_factory=lambda: secrets.randbelow(65536))
+    rtp_timestamp: int = field(default_factory=lambda: secrets.randbits(32))
+    rtp_ssrc: int = field(default_factory=lambda: secrets.randbits(32))
 
 
 class RoomStreamHub:
@@ -525,6 +548,22 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         if codec == "PCMA":
             return _linear16le_to_pcma(pcm_frame)
         return _linear16le_to_pcmu(pcm_frame)
+
+    def _telnyx_stream_rtp_packet(pcm_frame: bytes, runtime: TelnyxStreamRuntime, *, marker: bool = False) -> bytes:
+        codec = (app.config.get("ROOMCAST_TELNYX_STREAM_CODEC") or "PCMU").strip().upper()
+        encoded_payload = _telnyx_stream_payload_from_pcm(pcm_frame)
+        sample_count = max(1, len(pcm_frame) // 2)
+        packet = _rtp_packet(
+            encoded_payload,
+            payload_type=_rtp_payload_type_for_codec(codec),
+            sequence_number=runtime.rtp_sequence_number,
+            timestamp=runtime.rtp_timestamp,
+            ssrc=runtime.rtp_ssrc,
+            marker=marker,
+        )
+        runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) % 65536
+        runtime.rtp_timestamp = (runtime.rtp_timestamp + sample_count) % (1 << 32)
+        return packet
 
     def _collect_telephony_segment(session_state: TelephonySessionState) -> tuple[bytes, bool]:
         session_state.last_access_at = time.time()
@@ -831,11 +870,11 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 while len(pcm_buffer) >= frame_pcm_bytes and not runtime.stop_event.is_set():
                     frame_pcm = bytes(pcm_buffer[:frame_pcm_bytes])
                     del pcm_buffer[:frame_pcm_bytes]
-                    payload = _telnyx_stream_payload_from_pcm(frame_pcm)
+                    payload = _telnyx_stream_rtp_packet(frame_pcm, runtime)
                     ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
 
                 if not chunk and len(pcm_buffer) < frame_pcm_bytes and not runtime.stop_event.is_set():
-                    payload = _telnyx_stream_payload_from_pcm(silence_frame)
+                    payload = _telnyx_stream_rtp_packet(silence_frame, runtime)
                     ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
         except ConnectionClosed:
             _telephony_log("telnyx-stream-send-closed", session_id=session_state.session_id, stream_id=runtime.stream_id)
