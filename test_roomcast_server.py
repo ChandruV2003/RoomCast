@@ -199,6 +199,18 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertEqual(host_payload["current_device"], "")
         self.assertEqual(host_payload["known_devices"], [])
 
+    def test_room_status_listener_count_excludes_monitor_stream(self):
+        self.client.get("/p/7070", follow_redirects=True)
+        self.app.stream_hub.start_broadcast("meeting-hall", "hp-pavilion-14m-ba1xx")
+        listener_id, _, _ = self.app.stream_hub.open_listener("meeting-hall")
+        try:
+            response = self.client.get("/api/rooms/meeting-hall/status")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["listener_count"], 0)
+        finally:
+            self.app.stream_hub.close_listener("meeting-hall", listener_id)
+
     def test_source_heartbeat_returns_ingest_url(self):
         host = self.app.roomcast_store.get_host("hp-pavilion-14m-ba1xx", include_secret=True)
         response = self.client.post(

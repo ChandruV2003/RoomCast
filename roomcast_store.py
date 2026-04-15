@@ -795,6 +795,19 @@ class RoomCastStore:
                 for row in rows
             ]
 
+    def count_active_listener_sessions(self, room_slug: str) -> int:
+        with self._connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(DISTINCT participant_key)
+                FROM listener_sessions
+                WHERE room_slug = ?
+                  AND left_at IS NULL
+                """,
+                (room_slug,),
+            ).fetchone()[0]
+        return int(count or 0)
+
     def record_heartbeat(
         self,
         host_slug: str,

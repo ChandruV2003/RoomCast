@@ -756,6 +756,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             device_options = _device_options(host, runtime)
             schedule_rows = _schedule_rows_display(host["schedules"])
             active_schedule_rows = [row for row in schedule_rows if row["enabled"]]
+            active_listener_count = roomcast_store.count_active_listener_sessions(host["room_slug"])
             hosts.append(
                 {
                     **host,
@@ -772,7 +773,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                     "priority": host.get("priority", 0),
                     "room_alias": _room_alias(host["room_slug"], host["room_label"]),
                     "broadcasting": stream_hub.status(host["room_slug"])["broadcasting"],
-                    "listener_count": stream_hub.status(host["room_slug"])["listener_count"],
+                    "listener_count": active_listener_count,
                     "active_listeners": [
                         _decorate_listener(listener)
                         for listener in roomcast_store.list_listener_sessions(host["room_slug"], active_only=True, limit=6)
@@ -1056,7 +1057,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             "runtime": host["runtime"] if host else None,
             "is_ingesting": bool((host["runtime"] or {}).get("is_ingesting")) if host else False,
             "broadcasting": hub_status["broadcasting"],
-            "listener_count": hub_status["listener_count"],
+            "listener_count": host["listener_count"] if host else roomcast_store.count_active_listener_sessions(room_slug),
             "last_chunk_at": hub_status["last_chunk_at"],
             "current_device": (host["runtime"] or {}).get("current_device") if host else "",
             "last_error": _compact_error((host["runtime"] or {}).get("last_error")) if host else "",
