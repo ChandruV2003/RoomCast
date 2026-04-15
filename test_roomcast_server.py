@@ -28,6 +28,8 @@ class RoomCastServerTests(unittest.TestCase):
                 "ROOMCAST_TWILIO_WEBHOOK_TOKEN": "twilio-test-token",
                 "ROOMCAST_TELNYX_WEBHOOK_TOKEN": "telnyx-test-token",
                 "ROOMCAST_TELEPHONY_SECRET": "telephony-test-secret",
+                "ROOMCAST_TELEPHONY_SEGMENT_SECONDS": 0.1,
+                "ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS": 0.1,
             }
         )
         self.client = self.app.test_client()
@@ -248,9 +250,8 @@ class RoomCastServerTests(unittest.TestCase):
         )
         self.assertEqual(connect.status_code, 200)
         self.assertIn(b"<Play>", connect.data)
-        self.assertIn(b"/telephony/stream/", connect.data)
-        self.assertIn(b".wav", connect.data)
-        self.assertIn(b"%2B19735551212", connect.data)
+        self.assertIn(b"/telephony/session/", connect.data)
+        self.assertIn(b"<Redirect", connect.data)
 
     def test_telnyx_voice_returns_gather_then_stream_url(self):
         gather = self.client.post("/telephony/telnyx/telnyx-test-token/voice")
@@ -263,9 +264,21 @@ class RoomCastServerTests(unittest.TestCase):
         )
         self.assertEqual(connect.status_code, 200)
         self.assertIn(b"<Play>", connect.data)
-        self.assertIn(b"/telephony/stream/", connect.data)
-        self.assertIn(b".wav", connect.data)
-        self.assertIn(b"%2B19735550000", connect.data)
+        self.assertIn(b"/telephony/session/", connect.data)
+        self.assertIn(b"<Redirect", connect.data)
+
+    def test_telnyx_session_segment_returns_buffered_wav(self):
+        connect = self.client.post(
+            "/telephony/telnyx/telnyx-test-token/voice",
+            data={"Digits": "7070", "CallerId": "+19735550000"},
+        )
+        self.assertEqual(connect.status_code, 200)
+        play_url = connect.data.decode().split("<Play>", 1)[1].split("</Play>", 1)[0]
+        segment_path = play_url.replace("http://localhost", "").replace("https://localhost", "")
+        response = self.client.get(segment_path)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "audio/wav")
+        self.assertTrue(response.data.startswith(b"RIFF"))
 
     def test_telephony_stream_uses_phone_wav_profile(self):
         app = create_app(

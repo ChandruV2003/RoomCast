@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import queue
 import threading
@@ -54,6 +55,7 @@ TELEPHONY_STREAM_PROFILE = {
     "sample_rate_hz": 8000,
     "bits_per_sample": 16,
 }
+TELEPHONY_LISTENER_QUEUE_MAXSIZE = 384
 ROOM_ALIASES = {
     "study-room": "Room A",
     "meeting-hall": "Room B",
@@ -91,6 +93,30 @@ def _wav_stream_header(*, channels: int, sample_rate_hz: int, bits_per_sample: i
         b"data",
         placeholder_size,
     )
+
+
+def _wav_file_bytes(*, channels: int, sample_rate_hz: int, bits_per_sample: int, payload: bytes) -> bytes:
+    block_align = channels * (bits_per_sample // 8)
+    byte_rate = sample_rate_hz * block_align
+    data_size = len(payload)
+    riff_size = 36 + data_size
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate_hz,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+    return header + payload
 
 
 def _pcm24le_to_int(sample: bytes) -> int:
@@ -153,6 +179,21 @@ class RoomState:
     recent_chunks: deque[bytes] = field(default_factory=lambda: deque(maxlen=RECENT_CHUNK_BACKLOG))
 
 
+@dataclass
+class TelephonySessionState:
+    session_id: str
+    room_slug: str
+    participant_label: str
+    channel: str
+    listener_id: int
+    listener: queue.Queue
+    transcoder: TelephonyPcmTranscoder
+    listener_session_id: int
+    created_at: float
+    last_access_at: float
+    stream_ended: bool = False
+
+
 class RoomStreamHub:
     """Broadcast incoming byte streams to all active listeners in a room."""
 
@@ -213,14 +254,22 @@ class RoomStreamHub:
             except queue.Full:
                 continue
 
-    def listen(self, room_slug: str):
-        listener = queue.Queue(maxsize=LISTENER_QUEUE_MAXSIZE)
+    def open_listener(self, room_slug: str, *, maxsize: int = LISTENER_QUEUE_MAXSIZE, include_buffered: bool = True):
+        listener = queue.Queue(maxsize=maxsize)
         listener_id = id(listener)
-
         with self._lock:
             room = self._get_room(room_slug)
             room.listeners[listener_id] = listener
-            buffered_chunks = list(room.recent_chunks)
+            buffered_chunks = list(room.recent_chunks) if include_buffered else []
+        return listener_id, listener, buffered_chunks
+
+    def close_listener(self, room_slug: str, listener_id: int):
+        with self._lock:
+            room = self._get_room(room_slug)
+            room.listeners.pop(listener_id, None)
+
+    def listen(self, room_slug: str):
+        listener_id, listener, buffered_chunks = self.open_listener(room_slug, maxsize=LISTENER_QUEUE_MAXSIZE)
 
         try:
             if buffered_chunks:
@@ -235,9 +284,7 @@ class RoomStreamHub:
                     break
                 yield chunk
         finally:
-            with self._lock:
-                room = self._get_room(room_slug)
-                room.listeners.pop(listener_id, None)
+            self.close_listener(room_slug, listener_id)
 
     def status(self, room_slug: str):
         with self._lock:
@@ -262,6 +309,9 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_PUBLIC_NAME=os.getenv("ROOMCAST_PUBLIC_NAME", "NTC Newark WebCall"),
         ROOMCAST_LISTENER_NAME=os.getenv("ROOMCAST_LISTENER_NAME", "NTC Newark WebCall"),
         ROOMCAST_TELEPHONY_PUBLIC_BASE_URL=os.getenv("ROOMCAST_TELEPHONY_PUBLIC_BASE_URL", "https://ntcnas.myftp.org"),
+        ROOMCAST_TELEPHONY_SEGMENT_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SEGMENT_SECONDS", "2.5")),
+        ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS", "3.0")),
+        ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS", "120")),
         ROOMCAST_STREAM_PROFILE=os.getenv("ROOMCAST_STREAM_PROFILE", "mp3"),
         ROOMCAST_ADMIN_PASSWORD=os.getenv("ROOMCAST_ADMIN_PASSWORD", ""),
         ROOMCAST_TELEPHONY_SECRET=os.getenv("ROOMCAST_TELEPHONY_SECRET", ""),
@@ -282,12 +332,130 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     app.roomcast_store = roomcast_store
     app.stream_hub = stream_hub
     geolookup_cache: dict[str, tuple[float, str | None]] = {}
+    telephony_sessions: dict[str, TelephonySessionState] = {}
+    app.logger.setLevel(logging.INFO)
 
     def _project_name() -> str:
         return app.config["ROOMCAST_PUBLIC_NAME"]
 
     def _listener_name() -> str:
         return app.config["ROOMCAST_LISTENER_NAME"]
+
+    def _telephony_log(stage: str, **fields):
+        details = []
+        for key, value in fields.items():
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            details.append(f"{key}={text}")
+        suffix = " " + " ".join(details) if details else ""
+        app.logger.info("telephony[%s]%s", stage, suffix)
+
+    def _telephony_segment_target_bytes() -> int:
+        seconds = max(1.0, float(app.config.get("ROOMCAST_TELEPHONY_SEGMENT_SECONDS", 2.5)))
+        bytes_per_second = (
+            TELEPHONY_STREAM_PROFILE["sample_rate_hz"]
+            * TELEPHONY_STREAM_PROFILE["channels"]
+            * (TELEPHONY_STREAM_PROFILE["bits_per_sample"] // 8)
+        )
+        return int(seconds * bytes_per_second)
+
+    def _close_telephony_session(session_id: str, *, reason: str = ""):
+        session_state = telephony_sessions.pop(session_id, None)
+        if not session_state:
+            return
+        stream_hub.close_listener(session_state.room_slug, session_state.listener_id)
+        roomcast_store.end_listener_session(session_state.listener_session_id)
+        _telephony_log("session-close", session_id=session_id, room_slug=session_state.room_slug, reason=reason)
+
+    def _cleanup_telephony_sessions():
+        expiry_seconds = max(30.0, float(app.config.get("ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS", 120.0)))
+        cutoff = time.time() - expiry_seconds
+        expired = [
+            session_id
+            for session_id, session_state in telephony_sessions.items()
+            if session_state.last_access_at < cutoff
+        ]
+        for session_id in expired:
+            _close_telephony_session(session_id, reason="expired")
+
+    def _create_telephony_session(room_slug: str, *, participant_label: str, channel: str = "phone") -> TelephonySessionState:
+        _cleanup_telephony_sessions()
+        session_id = secrets.token_urlsafe(18)
+        participant_key = f"{channel}:{participant_label}:{session_id}"
+        listener_session_id = roomcast_store.begin_listener_session(
+            room_slug,
+            channel=channel,
+            participant_label=participant_label,
+            participant_key=participant_key,
+            ip_address=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+        listener_id, listener, _buffered_chunks = stream_hub.open_listener(
+            room_slug,
+            maxsize=TELEPHONY_LISTENER_QUEUE_MAXSIZE,
+            include_buffered=False,
+        )
+        snapshot = _room_snapshot(room_slug)
+        descriptor = _stream_descriptor(snapshot)
+        session_state = TelephonySessionState(
+            session_id=session_id,
+            room_slug=room_slug,
+            participant_label=participant_label,
+            channel=channel,
+            listener_id=listener_id,
+            listener=listener,
+            transcoder=TelephonyPcmTranscoder(
+                source_channels=descriptor.get("channels", 1),
+                source_rate_hz=descriptor.get("sample_rate_hz", 48000),
+                bits_per_sample=descriptor.get("bits_per_sample", 24),
+            ),
+            listener_session_id=listener_session_id,
+            created_at=time.time(),
+            last_access_at=time.time(),
+        )
+        telephony_sessions[session_id] = session_state
+        _telephony_log("session-open", session_id=session_id, room_slug=room_slug, label=participant_label, channel=channel)
+        return session_state
+
+    def _telephony_session_segment_url(session_id: str, *, sequence: int | None = None) -> str:
+        cache_buster = sequence if sequence is not None else int(time.time() * 1000)
+        return _telephony_public_url("telephony_session_segment", session_id=session_id, seq=cache_buster)
+
+    def _collect_telephony_segment(session_state: TelephonySessionState) -> tuple[bytes, bool]:
+        session_state.last_access_at = time.time()
+        target_bytes = _telephony_segment_target_bytes()
+        timeout_seconds = max(
+            0.5,
+            float(app.config.get("ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS", 3.0)),
+        )
+        deadline = time.time() + timeout_seconds
+        pcm_payload = bytearray()
+        stream_closed = False
+        while len(pcm_payload) < target_bytes and time.time() < deadline:
+            remaining = max(0.05, deadline - time.time())
+            try:
+                chunk = session_state.listener.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if chunk is None:
+                stream_closed = True
+                break
+            converted = session_state.transcoder.transcode(chunk)
+            if converted:
+                pcm_payload.extend(converted)
+        if len(pcm_payload) < target_bytes:
+            pcm_payload.extend(b"\x00" * (target_bytes - len(pcm_payload)))
+        payload = bytes(pcm_payload[:target_bytes])
+        wav_bytes = _wav_file_bytes(
+            channels=TELEPHONY_STREAM_PROFILE["channels"],
+            sample_rate_hz=TELEPHONY_STREAM_PROFILE["sample_rate_hz"],
+            bits_per_sample=TELEPHONY_STREAM_PROFILE["bits_per_sample"],
+            payload=payload,
+        )
+        return wav_bytes, stream_closed
 
     def _stream_profile_name() -> str:
         configured = (app.config.get("ROOMCAST_STREAM_PROFILE") or "mp3").strip().lower()
@@ -533,11 +701,21 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
   <Redirect method="POST">{escape(retry_url)}</Redirect>
 </Response>"""
 
-    def _voice_connect_xml(stream_url: str) -> str:
+    def _voice_connect_xml(stream_url: str, continue_url: str | None = None) -> str:
+        redirect_xml = ""
+        if continue_url:
+            redirect_xml = f'\n  <Redirect method="POST">{escape(continue_url)}</Redirect>'
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Connecting you now.</Say>
   <Play>{escape(stream_url)}</Play>
+{redirect_xml}
+</Response>"""
+
+    def _voice_goodbye_xml(message: str = "The line is no longer available. Goodbye.") -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{escape(message)}</Say>
 </Response>"""
 
     def _is_admin() -> bool:
@@ -1407,18 +1585,29 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     @app.get("/telephony/stream/<room_slug>.wav")
     @app.get("/telephony/stream/<room_slug>.mp3")
     def telephony_stream(room_slug: str):
+        participant_label = (request.args.get("label") or "Phone caller").strip() or "Phone caller"
+        channel = (request.args.get("channel") or "phone").strip() or "phone"
+        _telephony_log(
+            "stream-request",
+            room_slug=room_slug,
+            channel=channel,
+            label=participant_label,
+            remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
         room = roomcast_store.get_room(room_slug)
         if not room or not room["enabled"]:
+            _telephony_log("stream-missing-room", room_slug=room_slug)
             return jsonify({"error": "unknown room"}), 404
         snapshot = _room_snapshot(room_slug)
         if _stream_descriptor(snapshot)["mimetype"] != "audio/wav":
+            _telephony_log("stream-wrong-profile", room_slug=room_slug, profile=_stream_descriptor(snapshot)["mimetype"])
             return jsonify({"error": "telephony requires wav profile"}), 503
 
         expires_at = request.args.get("exp", "")
         signature = request.args.get("sig", "")
-        participant_label = (request.args.get("label") or "Phone caller").strip() or "Phone caller"
-        channel = (request.args.get("channel") or "phone").strip() or "phone"
         if not _telephony_stream_is_valid(room_slug, expires_at, signature, participant_label, channel):
+            _telephony_log("stream-unauthorized", room_slug=room_slug, channel=channel, label=participant_label)
             return jsonify({"error": "unauthorized"}), 403
 
         participant_key = f"{channel}:{participant_label}:{expires_at}"
@@ -1432,19 +1621,54 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         )
 
         def _stream():
+            _telephony_log("stream-open", room_slug=room_slug, channel=channel, label=participant_label)
             try:
                 yield from stream_hub.listen(room_slug)
             finally:
                 roomcast_store.end_listener_session(listener_session_id)
+                _telephony_log("stream-close", room_slug=room_slug, channel=channel, label=participant_label)
         return _telephony_stream_response(_stream, snapshot)
+
+    @app.get("/telephony/session/<session_id>/segment.wav")
+    def telephony_session_segment(session_id: str):
+        _cleanup_telephony_sessions()
+        session_state = telephony_sessions.get(session_id)
+        if not session_state:
+            _telephony_log("segment-missing-session", session_id=session_id)
+            return jsonify({"error": "unknown session"}), 404
+        wav_bytes, stream_closed = _collect_telephony_segment(session_state)
+        session_state.stream_ended = stream_closed
+        _telephony_log(
+            "segment-rendered",
+            session_id=session_id,
+            room_slug=session_state.room_slug,
+            label=session_state.participant_label,
+            bytes=len(wav_bytes),
+            ended=stream_closed,
+        )
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Content-Length": str(len(wav_bytes)),
+        }
+        return Response(wav_bytes, mimetype=TELEPHONY_STREAM_PROFILE["mimetype"], headers=headers)
 
     @app.route("/telephony/twilio/<webhook_token>/voice", methods=["GET", "POST"])
     def twilio_voice(webhook_token: str):
         expected = app.config.get("ROOMCAST_TWILIO_WEBHOOK_TOKEN", "")
         if not expected or not hmac.compare_digest(webhook_token, expected):
+            _telephony_log("twilio-unauthorized", remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr or ""))
             return jsonify({"error": "not found"}), 404
 
         digits = (request.values.get("Digits") or "").strip()
+        _telephony_log(
+            "twilio-voice",
+            method=request.method,
+            digits=digits or "<none>",
+            from_number=request.values.get("From", ""),
+            remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
         if not digits:
             action_url = _telephony_public_url("twilio_voice", webhook_token=webhook_token)
             return Response(_voice_gather_xml(action_url), mimetype="text/xml")
@@ -1452,19 +1676,51 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         snapshot = _resolve_public_room(digits)
         if not snapshot:
             retry_url = _telephony_public_url("twilio_voice", webhook_token=webhook_token)
+            _telephony_log("twilio-invalid-pin", digits=digits, retry_url=retry_url)
             return Response(_voice_invalid_pin_xml(retry_url), mimetype="text/xml")
 
         participant_label = (request.values.get("From") or "Phone caller").strip() or "Phone caller"
-        stream_url = _telephony_stream_url(snapshot["slug"], participant_label=participant_label)
-        return Response(_voice_connect_xml(stream_url), mimetype="text/xml")
+        session_state = _create_telephony_session(snapshot["slug"], participant_label=participant_label)
+        continue_url = _telephony_public_url("twilio_continue", webhook_token=webhook_token, session_id=session_state.session_id)
+        stream_url = _telephony_session_segment_url(session_state.session_id)
+        _telephony_log("twilio-connect", room_slug=snapshot["slug"], label=participant_label, stream_url=stream_url)
+        return Response(_voice_connect_xml(stream_url, continue_url), mimetype="text/xml")
+
+    @app.route("/telephony/twilio/<webhook_token>/continue/<session_id>", methods=["GET", "POST"])
+    def twilio_continue(webhook_token: str, session_id: str):
+        expected = app.config.get("ROOMCAST_TWILIO_WEBHOOK_TOKEN", "")
+        if not expected or not hmac.compare_digest(webhook_token, expected):
+            return jsonify({"error": "not found"}), 404
+        _cleanup_telephony_sessions()
+        session_state = telephony_sessions.get(session_id)
+        if not session_state:
+            return Response(_voice_goodbye_xml(), mimetype="text/xml")
+        session_state.last_access_at = time.time()
+        snapshot = _room_snapshot(session_state.room_slug)
+        if not snapshot or not snapshot["broadcasting"] or session_state.stream_ended:
+            _close_telephony_session(session_id, reason="room-ended")
+            return Response(_voice_goodbye_xml(), mimetype="text/xml")
+        continue_url = _telephony_public_url("twilio_continue", webhook_token=webhook_token, session_id=session_id)
+        stream_url = _telephony_session_segment_url(session_id)
+        _telephony_log("twilio-continue", session_id=session_id, room_slug=session_state.room_slug, stream_url=stream_url)
+        return Response(_voice_connect_xml(stream_url, continue_url), mimetype="text/xml")
 
     @app.route("/telephony/telnyx/<webhook_token>/voice", methods=["GET", "POST"])
     def telnyx_voice(webhook_token: str):
         expected = app.config.get("ROOMCAST_TELNYX_WEBHOOK_TOKEN", "")
         if not expected or not hmac.compare_digest(webhook_token, expected):
+            _telephony_log("telnyx-unauthorized", remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr or ""))
             return jsonify({"error": "not found"}), 404
 
         digits = (request.values.get("Digits") or "").strip()
+        _telephony_log(
+            "telnyx-voice",
+            method=request.method,
+            digits=digits or "<none>",
+            from_number=request.values.get("From") or request.values.get("CallerId") or "",
+            remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
         if not digits:
             action_url = _telephony_public_url("telnyx_voice", webhook_token=webhook_token)
             return Response(_voice_gather_xml(action_url), mimetype="text/xml")
@@ -1472,6 +1728,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         snapshot = _resolve_public_room(digits)
         if not snapshot:
             retry_url = _telephony_public_url("telnyx_voice", webhook_token=webhook_token)
+            _telephony_log("telnyx-invalid-pin", digits=digits, retry_url=retry_url)
             return Response(_voice_invalid_pin_xml(retry_url), mimetype="text/xml")
 
         participant_label = (
@@ -1479,8 +1736,30 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             or request.values.get("CallerId")
             or "Phone caller"
         ).strip() or "Phone caller"
-        stream_url = _telephony_stream_url(snapshot["slug"], participant_label=participant_label)
-        return Response(_voice_connect_xml(stream_url), mimetype="text/xml")
+        session_state = _create_telephony_session(snapshot["slug"], participant_label=participant_label)
+        continue_url = _telephony_public_url("telnyx_continue", webhook_token=webhook_token, session_id=session_state.session_id)
+        stream_url = _telephony_session_segment_url(session_state.session_id)
+        _telephony_log("telnyx-connect", room_slug=snapshot["slug"], label=participant_label, stream_url=stream_url)
+        return Response(_voice_connect_xml(stream_url, continue_url), mimetype="text/xml")
+
+    @app.route("/telephony/telnyx/<webhook_token>/continue/<session_id>", methods=["GET", "POST"])
+    def telnyx_continue(webhook_token: str, session_id: str):
+        expected = app.config.get("ROOMCAST_TELNYX_WEBHOOK_TOKEN", "")
+        if not expected or not hmac.compare_digest(webhook_token, expected):
+            return jsonify({"error": "not found"}), 404
+        _cleanup_telephony_sessions()
+        session_state = telephony_sessions.get(session_id)
+        if not session_state:
+            return Response(_voice_goodbye_xml(), mimetype="text/xml")
+        session_state.last_access_at = time.time()
+        snapshot = _room_snapshot(session_state.room_slug)
+        if not snapshot or not snapshot["broadcasting"] or session_state.stream_ended:
+            _close_telephony_session(session_id, reason="room-ended")
+            return Response(_voice_goodbye_xml(), mimetype="text/xml")
+        continue_url = _telephony_public_url("telnyx_continue", webhook_token=webhook_token, session_id=session_id)
+        stream_url = _telephony_session_segment_url(session_id)
+        _telephony_log("telnyx-continue", session_id=session_id, room_slug=session_state.room_slug, stream_url=stream_url)
+        return Response(_voice_connect_xml(stream_url, continue_url), mimetype="text/xml")
 
     @app.post("/api/source/heartbeat")
     def source_heartbeat():
