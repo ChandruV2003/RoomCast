@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import base64
 import queue
 import threading
 import hmac
@@ -18,11 +19,14 @@ import struct
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, session, url_for
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from roomcast_store import RoomCastStore
@@ -126,13 +130,65 @@ def _pcm24le_to_int(sample: bytes) -> int:
     return value
 
 
-class TelephonyPcmTranscoder:
-    """Convert live 24-bit PCM frames into a phone-friendly mono WAV stream."""
+def _linear16_to_pcmu_sample(sample: int) -> int:
+    clip = 32635
+    bias = 0x84
+    sign = 0x80 if sample < 0 else 0x00
+    magnitude = min(abs(sample), clip) + bias
+    exponent = 7
+    mask = 0x4000
+    while exponent > 0 and not (magnitude & mask):
+        exponent -= 1
+        mask >>= 1
+    mantissa = (magnitude >> (exponent + 3)) & 0x0F
+    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
 
-    def __init__(self, *, source_channels: int, source_rate_hz: int, bits_per_sample: int):
+
+def _linear16le_to_pcmu(pcm_bytes: bytes) -> bytes:
+    payload = bytearray()
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    for offset in range(0, usable, 2):
+        sample = struct.unpack_from("<h", pcm_bytes, offset)[0]
+        payload.append(_linear16_to_pcmu_sample(sample))
+    return bytes(payload)
+
+
+def _linear16_to_pcma_sample(sample: int) -> int:
+    if sample >= 0:
+        mask = 0xD5
+    else:
+        mask = 0x55
+        sample = -sample - 1
+    sample = min(sample, 0x7FFF)
+    if sample < 256:
+        aval = sample >> 4
+    else:
+        segment = 1
+        value = sample >> 8
+        while value > 1 and segment < 8:
+            value >>= 1
+            segment += 1
+        aval = (segment << 4) | ((sample >> (segment + 3)) & 0x0F)
+    return aval ^ mask
+
+
+def _linear16le_to_pcma(pcm_bytes: bytes) -> bytes:
+    payload = bytearray()
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    for offset in range(0, usable, 2):
+        sample = struct.unpack_from("<h", pcm_bytes, offset)[0]
+        payload.append(_linear16_to_pcma_sample(sample))
+    return bytes(payload)
+
+
+class TelephonyPcmTranscoder:
+    """Convert live PCM frames into a phone-friendly mono PCM16 stream."""
+
+    def __init__(self, *, source_channels: int, source_rate_hz: int, bits_per_sample: int, output_rate_hz: int):
         self.source_channels = max(1, int(source_channels or 1))
         self.source_rate_hz = max(8000, int(source_rate_hz or 48000))
         self.bits_per_sample = max(16, int(bits_per_sample or 24))
+        self.output_rate_hz = max(8000, int(output_rate_hz or 8000))
         self._bytes_per_sample = max(1, self.bits_per_sample // 8)
         self._frame_width = self.source_channels * self._bytes_per_sample
         self._carry = b""
@@ -141,8 +197,6 @@ class TelephonyPcmTranscoder:
     def transcode(self, chunk: bytes) -> bytes:
         if not chunk:
             return b""
-        if self.bits_per_sample != 24:
-            return chunk
 
         data = self._carry + chunk
         usable = len(data) - (len(data) % self._frame_width)
@@ -150,7 +204,7 @@ class TelephonyPcmTranscoder:
         output = bytearray()
         for offset in range(0, usable, self._frame_width):
             frame = data[offset:offset + self._frame_width]
-            self._sample_accumulator += TELEPHONY_STREAM_PROFILE["sample_rate_hz"]
+            self._sample_accumulator += self.output_rate_hz
             if self._sample_accumulator < self.source_rate_hz:
                 continue
             self._sample_accumulator -= self.source_rate_hz
@@ -159,7 +213,14 @@ class TelephonyPcmTranscoder:
             for channel_index in range(self.source_channels):
                 start = channel_index * self._bytes_per_sample
                 stop = start + self._bytes_per_sample
-                frame_samples.append(_pcm24le_to_int(frame[start:stop]))
+                raw_sample = frame[start:stop]
+                if self.bits_per_sample == 24:
+                    sample_value = _pcm24le_to_int(raw_sample)
+                elif self.bits_per_sample == 16:
+                    sample_value = struct.unpack("<h", raw_sample)[0] << 8
+                else:
+                    continue
+                frame_samples.append(sample_value)
             mixed = int(sum(frame_samples) / len(frame_samples))
             pcm16 = max(-32768, min(32767, mixed >> 8))
             output.extend(struct.pack("<h", pcm16))
@@ -192,6 +253,13 @@ class TelephonySessionState:
     created_at: float
     last_access_at: float
     stream_ended: bool = False
+
+
+@dataclass
+class TelnyxStreamRuntime:
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    sender_thread: threading.Thread | None = None
+    stream_id: str = ""
 
 
 class RoomStreamHub:
@@ -313,6 +381,10 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_TELEPHONY_SEGMENT_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SEGMENT_SECONDS", "2.5")),
         ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS", "3.0")),
         ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS", "120")),
+        ROOMCAST_TELNYX_TRANSPORT=os.getenv("ROOMCAST_TELNYX_TRANSPORT", "websocket"),
+        ROOMCAST_TELNYX_STREAM_CODEC=os.getenv("ROOMCAST_TELNYX_STREAM_CODEC", "PCMU"),
+        ROOMCAST_TELNYX_STREAM_SAMPLE_RATE=int(os.getenv("ROOMCAST_TELNYX_STREAM_SAMPLE_RATE", "8000")),
+        ROOMCAST_TELNYX_STREAM_FRAME_MS=int(os.getenv("ROOMCAST_TELNYX_STREAM_FRAME_MS", "20")),
         ROOMCAST_STREAM_PROFILE=os.getenv("ROOMCAST_STREAM_PROFILE", "mp3"),
         ROOMCAST_ADMIN_PASSWORD=os.getenv("ROOMCAST_ADMIN_PASSWORD", ""),
         ROOMCAST_TELEPHONY_SECRET=os.getenv("ROOMCAST_TELEPHONY_SECRET", ""),
@@ -329,11 +401,13 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     roomcast_store = store or RoomCastStore(app.config.get("ROOMCAST_DB_PATH"))
     stream_hub = hub or RoomStreamHub()
+    sock = Sock(app)
     roomcast_store.close_orphaned_listener_sessions()
     app.roomcast_store = roomcast_store
     app.stream_hub = stream_hub
     geolookup_cache: dict[str, tuple[float, str | None]] = {}
     telephony_sessions: dict[str, TelephonySessionState] = {}
+    telnyx_stream_runtimes: dict[str, TelnyxStreamRuntime] = {}
     app.logger.setLevel(logging.INFO)
 
     def _project_name() -> str:
@@ -364,6 +438,9 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         return int(seconds * bytes_per_second)
 
     def _close_telephony_session(session_id: str, *, reason: str = ""):
+        runtime = telnyx_stream_runtimes.pop(session_id, None)
+        if runtime:
+            runtime.stop_event.set()
         session_state = telephony_sessions.pop(session_id, None)
         if not session_state:
             return
@@ -412,18 +489,42 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 source_channels=descriptor.get("channels", 1),
                 source_rate_hz=descriptor.get("sample_rate_hz", 48000),
                 bits_per_sample=descriptor.get("bits_per_sample", 24),
+                output_rate_hz=TELEPHONY_STREAM_PROFILE["sample_rate_hz"],
             ),
             listener_session_id=listener_session_id,
             created_at=time.time(),
             last_access_at=time.time(),
         )
         telephony_sessions[session_id] = session_state
+        telnyx_stream_runtimes[session_id] = TelnyxStreamRuntime()
         _telephony_log("session-open", session_id=session_id, room_slug=room_slug, label=participant_label, channel=channel)
         return session_state
 
     def _telephony_session_segment_url(session_id: str, *, sequence: int | None = None) -> str:
         cache_buster = sequence if sequence is not None else int(time.time() * 1000)
         return _telephony_public_url("telephony_session_segment", session_id=session_id, seq=cache_buster)
+
+    def _telephony_websocket_url(endpoint: str, **values) -> str:
+        url = _telephony_public_url(endpoint, **values)
+        if url.startswith("https://"):
+            return "wss://" + url[len("https://"):]
+        if url.startswith("http://"):
+            return "ws://" + url[len("http://"):]
+        return url
+
+    def _telnyx_stream_transport_enabled() -> bool:
+        return (app.config.get("ROOMCAST_TELNYX_TRANSPORT") or "").strip().lower() == "websocket"
+
+    def _telnyx_stream_frame_bytes() -> int:
+        frame_ms = max(20, int(app.config.get("ROOMCAST_TELNYX_STREAM_FRAME_MS", 20)))
+        sample_rate = max(8000, int(app.config.get("ROOMCAST_TELNYX_STREAM_SAMPLE_RATE", 8000)))
+        return int(sample_rate * frame_ms / 1000) * 2
+
+    def _telnyx_stream_payload_from_pcm(pcm_frame: bytes) -> bytes:
+        codec = (app.config.get("ROOMCAST_TELNYX_STREAM_CODEC") or "PCMU").strip().upper()
+        if codec == "PCMA":
+            return _linear16le_to_pcma(pcm_frame)
+        return _linear16le_to_pcmu(pcm_frame)
 
     def _collect_telephony_segment(session_state: TelephonySessionState) -> tuple[bytes, bool]:
         session_state.last_access_at = time.time()
@@ -618,7 +719,13 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     def _telephony_public_url(endpoint: str, **values) -> str:
         base = (app.config.get("ROOMCAST_TELEPHONY_PUBLIC_BASE_URL") or request.host_url).rstrip("/")
-        return f"{base}{url_for(endpoint, **values)}"
+        path = url_for(endpoint, **values)
+        if "://" in path:
+            split = urlsplit(path)
+            path = split.path
+            if split.query:
+                path = f"{path}?{split.query}"
+        return f"{base}{path}"
 
     def _sign_telephony_stream(room_slug: str, expires_at: int, participant_label: str, channel: str) -> str:
         payload = f"{room_slug}:{expires_at}:{participant_label}:{channel}".encode("utf-8")
@@ -673,6 +780,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 source_channels=source_descriptor.get("channels", 1),
                 source_rate_hz=source_descriptor.get("sample_rate_hz", 48000),
                 bits_per_sample=source_descriptor.get("bits_per_sample", 24),
+                output_rate_hz=TELEPHONY_STREAM_PROFILE["sample_rate_hz"],
             )
             for chunk in stream_factory():
                 if not chunk:
@@ -685,6 +793,60 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                     yield chunk
 
         return Response(_stream(), mimetype=TELEPHONY_STREAM_PROFILE["mimetype"], headers=headers)
+
+    def _send_telnyx_stream_audio(ws, session_state: TelephonySessionState, runtime: TelnyxStreamRuntime):
+        snapshot = _room_snapshot(session_state.room_slug)
+        descriptor = _stream_descriptor(snapshot)
+        sample_rate = max(8000, int(app.config.get("ROOMCAST_TELNYX_STREAM_SAMPLE_RATE", 8000)))
+        frame_pcm_bytes = _telnyx_stream_frame_bytes()
+        silence_frame = b"\x00" * frame_pcm_bytes
+        transcoder = TelephonyPcmTranscoder(
+            source_channels=descriptor.get("channels", 1),
+            source_rate_hz=descriptor.get("sample_rate_hz", 48000),
+            bits_per_sample=descriptor.get("bits_per_sample", 24),
+            output_rate_hz=sample_rate,
+        )
+        pcm_buffer = bytearray()
+        frame_seconds = max(0.02, int(app.config.get("ROOMCAST_TELNYX_STREAM_FRAME_MS", 20)) / 1000)
+
+        try:
+            while not runtime.stop_event.is_set():
+                session_state.last_access_at = time.time()
+                snapshot = _room_snapshot(session_state.room_slug)
+                if not snapshot or not snapshot["broadcasting"]:
+                    _telephony_log("telnyx-stream-room-ended", session_id=session_state.session_id, room_slug=session_state.room_slug)
+                    runtime.stop_event.set()
+                    break
+                try:
+                    chunk = session_state.listener.get(timeout=frame_seconds)
+                except queue.Empty:
+                    chunk = b""
+                if chunk is None:
+                    _telephony_log("telnyx-stream-listener-closed", session_id=session_state.session_id, room_slug=session_state.room_slug)
+                    runtime.stop_event.set()
+                    break
+                if chunk:
+                    pcm_buffer.extend(transcoder.transcode(chunk))
+
+                while len(pcm_buffer) >= frame_pcm_bytes and not runtime.stop_event.is_set():
+                    frame_pcm = bytes(pcm_buffer[:frame_pcm_bytes])
+                    del pcm_buffer[:frame_pcm_bytes]
+                    payload = _telnyx_stream_payload_from_pcm(frame_pcm)
+                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
+
+                if not chunk and len(pcm_buffer) < frame_pcm_bytes and not runtime.stop_event.is_set():
+                    payload = _telnyx_stream_payload_from_pcm(silence_frame)
+                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
+        except ConnectionClosed:
+            _telephony_log("telnyx-stream-send-closed", session_id=session_state.session_id, stream_id=runtime.stream_id)
+        except Exception as exc:
+            _telephony_log("telnyx-stream-send-error", session_id=session_state.session_id, error=exc)
+        finally:
+            runtime.stop_event.set()
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _voice_prompt_xml(message: str) -> str:
         voice = (app.config.get("ROOMCAST_TELEPHONY_VOICE") or "").strip()
@@ -723,6 +885,35 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   {_voice_prompt_xml(message)}
+</Response>"""
+
+    def _voice_telnyx_stream_xml(session_state: TelephonySessionState, webhook_token: str) -> str:
+        stream_url = _telephony_websocket_url(
+            "telnyx_stream_socket",
+            webhook_token=webhook_token,
+            session_id=session_state.session_id,
+        )
+        status_url = _telephony_public_url("telnyx_stream_status", webhook_token=webhook_token)
+        codec = (app.config.get("ROOMCAST_TELNYX_STREAM_CODEC") or "PCMU").strip().upper()
+        sample_rate = max(8000, int(app.config.get("ROOMCAST_TELNYX_STREAM_SAMPLE_RATE", 8000)))
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream
+      url="{escape(stream_url)}"
+      name="{escape(session_state.session_id)}"
+      bidirectionalMode="rtp"
+      bidirectionalCodec="{escape(codec)}"
+      bidirectionalSamplingRate="{sample_rate}"
+      statusCallback="{escape(status_url)}"
+      statusCallbackMethod="POST"
+      enableReconnect="false">
+      <Parameter name="session_id" value="{escape(session_state.session_id)}" />
+      <Parameter name="room_slug" value="{escape(session_state.room_slug)}" />
+      <Parameter name="participant_label" value="{escape(session_state.participant_label)}" />
+    </Stream>
+  </Connect>
+  <Hangup />
 </Response>"""
 
     def _is_admin() -> bool:
@@ -1745,6 +1936,15 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             or "Phone caller"
         ).strip() or "Phone caller"
         session_state = _create_telephony_session(snapshot["slug"], participant_label=participant_label)
+        if _telnyx_stream_transport_enabled():
+            stream_url = _telephony_websocket_url(
+                "telnyx_stream_socket",
+                webhook_token=webhook_token,
+                session_id=session_state.session_id,
+            )
+            _telephony_log("telnyx-connect-stream", room_slug=snapshot["slug"], label=participant_label, stream_url=stream_url)
+            return Response(_voice_telnyx_stream_xml(session_state, webhook_token), mimetype="text/xml")
+
         continue_url = _telephony_public_url("telnyx_continue", webhook_token=webhook_token, session_id=session_state.session_id)
         stream_url = _telephony_session_segment_url(session_state.session_id)
         _telephony_log("telnyx-connect", room_slug=snapshot["slug"], label=participant_label, stream_url=stream_url)
@@ -1768,6 +1968,101 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         stream_url = _telephony_session_segment_url(session_id)
         _telephony_log("telnyx-continue", session_id=session_id, room_slug=session_state.room_slug, stream_url=stream_url)
         return Response(_voice_connect_xml(stream_url, continue_url), mimetype="text/xml")
+
+    @app.route("/telephony/telnyx/<webhook_token>/stream-status", methods=["GET", "POST"])
+    def telnyx_stream_status(webhook_token: str):
+        expected = app.config.get("ROOMCAST_TELNYX_WEBHOOK_TOKEN", "")
+        if not expected or not hmac.compare_digest(webhook_token, expected):
+            return jsonify({"error": "not found"}), 404
+        payload = request.get_json(silent=True)
+        body = payload if isinstance(payload, dict) else request.form.to_dict(flat=True)
+        _telephony_log(
+            "telnyx-stream-status",
+            remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+            body=json.dumps(body, sort_keys=True)[:500],
+        )
+        return ("", 204)
+
+    @sock.route("/telephony/telnyx/<webhook_token>/stream/<session_id>")
+    def telnyx_stream_socket(ws, webhook_token: str, session_id: str):
+        expected = app.config.get("ROOMCAST_TELNYX_WEBHOOK_TOKEN", "")
+        if not expected or not hmac.compare_digest(webhook_token, expected):
+            ws.close()
+            return
+
+        _cleanup_telephony_sessions()
+        session_state = telephony_sessions.get(session_id)
+        runtime = telnyx_stream_runtimes.get(session_id)
+        if not session_state or not runtime:
+            _telephony_log("telnyx-stream-missing-session", session_id=session_id)
+            ws.close()
+            return
+
+        sender_started = False
+        runtime.stop_event.clear()
+        try:
+            while not runtime.stop_event.is_set():
+                message = ws.receive()
+                if message is None:
+                    break
+                session_state.last_access_at = time.time()
+                if not isinstance(message, str):
+                    continue
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    _telephony_log("telnyx-stream-bad-json", session_id=session_id)
+                    continue
+
+                event = (payload.get("event") or "").strip().lower()
+                if event == "connected":
+                    _telephony_log("telnyx-stream-connected", session_id=session_id)
+                    continue
+                if event == "start":
+                    runtime.stream_id = payload.get("stream_id", "") or runtime.stream_id
+                    _telephony_log(
+                        "telnyx-stream-start",
+                        session_id=session_id,
+                        room_slug=session_state.room_slug,
+                        stream_id=runtime.stream_id,
+                        media_format=json.dumps((payload.get("start") or {}).get("media_format") or {}, sort_keys=True),
+                    )
+                    if not sender_started:
+                        runtime.sender_thread = threading.Thread(
+                            target=_send_telnyx_stream_audio,
+                            args=(ws, session_state, runtime),
+                            daemon=True,
+                        )
+                        runtime.sender_thread.start()
+                        sender_started = True
+                    continue
+                if event == "dtmf":
+                    _telephony_log(
+                        "telnyx-stream-dtmf",
+                        session_id=session_id,
+                        digit=((payload.get("dtmf") or {}).get("digit") or ""),
+                    )
+                    continue
+                if event == "stop":
+                    _telephony_log("telnyx-stream-stop", session_id=session_id, stream_id=runtime.stream_id)
+                    runtime.stop_event.set()
+                    break
+                if event == "media":
+                    continue
+                _telephony_log("telnyx-stream-event", session_id=session_id, event=event or "<unknown>")
+        except ConnectionClosed:
+            _telephony_log("telnyx-stream-disconnected", session_id=session_id, stream_id=runtime.stream_id)
+        except Exception as exc:
+            _telephony_log("telnyx-stream-error", session_id=session_id, error=exc)
+        finally:
+            runtime.stop_event.set()
+            if runtime.sender_thread and runtime.sender_thread.is_alive():
+                runtime.sender_thread.join(timeout=1.0)
+            _close_telephony_session(session_id, reason="stream-ended")
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     @app.post("/api/source/heartbeat")
     def source_heartbeat():

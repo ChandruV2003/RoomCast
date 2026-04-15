@@ -267,7 +267,7 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"<Redirect", connect.data)
         self.assertNotIn(b"Connecting you now", connect.data)
 
-    def test_telnyx_voice_returns_gather_then_stream_url(self):
+    def test_telnyx_voice_returns_gather_then_websocket_stream_xml(self):
         gather = self.client.post("/telephony/telnyx/telnyx-test-token/voice")
         self.assertEqual(gather.status_code, 200)
         self.assertIn(b"<Gather", gather.data)
@@ -278,12 +278,15 @@ class RoomCastServerTests(unittest.TestCase):
             data={"Digits": "7070", "CallerId": "+19735550000"},
         )
         self.assertEqual(connect.status_code, 200)
-        self.assertIn(b"<Play>", connect.data)
-        self.assertIn(b"/telephony/session/", connect.data)
-        self.assertIn(b"<Redirect", connect.data)
-        self.assertNotIn(b"Connecting you now", connect.data)
+        self.assertIn(b"<Connect>", connect.data)
+        self.assertIn(b"<Stream", connect.data)
+        self.assertIn(b"bidirectionalMode=\"rtp\"", connect.data)
+        self.assertIn(b"bidirectionalCodec=\"PCMU\"", connect.data)
+        self.assertIn(b"wss://ntcnas.myftp.org/telephony/telnyx/telnyx-test-token/stream/", connect.data)
+        self.assertNotIn(b"<Play>", connect.data)
 
     def test_telnyx_session_segment_returns_buffered_wav(self):
+        self.app.config["ROOMCAST_TELNYX_TRANSPORT"] = "segment"
         connect = self.client.post(
             "/telephony/telnyx/telnyx-test-token/voice",
             data={"Digits": "7070", "CallerId": "+19735550000"},
@@ -295,6 +298,13 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, "audio/wav")
         self.assertTrue(response.data.startswith(b"RIFF"))
+
+    def test_telnyx_stream_status_accepts_callback(self):
+        response = self.client.post(
+            "/telephony/telnyx/telnyx-test-token/stream-status",
+            json={"event_type": "stream-started", "stream_id": "abc123"},
+        )
+        self.assertEqual(response.status_code, 204)
 
     def test_telephony_stream_uses_phone_wav_profile(self):
         app = create_app(
