@@ -243,6 +243,7 @@ class RoomCastServerTests(unittest.TestCase):
         gather = self.client.post("/telephony/twilio/twilio-test-token/voice")
         self.assertEqual(gather.status_code, 200)
         self.assertIn(b"<Gather", gather.data)
+        self.assertIn(b'voice="Polly.Joanna-Neural"', gather.data)
 
         connect = self.client.post(
             "/telephony/twilio/twilio-test-token/voice",
@@ -252,11 +253,13 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"<Play>", connect.data)
         self.assertIn(b"/telephony/session/", connect.data)
         self.assertIn(b"<Redirect", connect.data)
+        self.assertNotIn(b"Connecting you now", connect.data)
 
     def test_telnyx_voice_returns_gather_then_stream_url(self):
         gather = self.client.post("/telephony/telnyx/telnyx-test-token/voice")
         self.assertEqual(gather.status_code, 200)
         self.assertIn(b"<Gather", gather.data)
+        self.assertIn(b'voice="Polly.Joanna-Neural"', gather.data)
 
         connect = self.client.post(
             "/telephony/telnyx/telnyx-test-token/voice",
@@ -266,6 +269,7 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"<Play>", connect.data)
         self.assertIn(b"/telephony/session/", connect.data)
         self.assertIn(b"<Redirect", connect.data)
+        self.assertNotIn(b"Connecting you now", connect.data)
 
     def test_telnyx_session_segment_returns_buffered_wav(self):
         connect = self.client.post(

@@ -52,7 +52,7 @@ STREAM_PROFILES = {
 TELEPHONY_STREAM_PROFILE = {
     "mimetype": "audio/wav",
     "channels": 1,
-    "sample_rate_hz": 8000,
+    "sample_rate_hz": 16000,
     "bits_per_sample": 16,
 }
 TELEPHONY_LISTENER_QUEUE_MAXSIZE = 384
@@ -309,6 +309,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_PUBLIC_NAME=os.getenv("ROOMCAST_PUBLIC_NAME", "NTC Newark WebCall"),
         ROOMCAST_LISTENER_NAME=os.getenv("ROOMCAST_LISTENER_NAME", "NTC Newark WebCall"),
         ROOMCAST_TELEPHONY_PUBLIC_BASE_URL=os.getenv("ROOMCAST_TELEPHONY_PUBLIC_BASE_URL", "https://ntcnas.myftp.org"),
+        ROOMCAST_TELEPHONY_VOICE=os.getenv("ROOMCAST_TELEPHONY_VOICE", "Polly.Joanna-Neural"),
         ROOMCAST_TELEPHONY_SEGMENT_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SEGMENT_SECONDS", "2.5")),
         ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SEGMENT_TIMEOUT_SECONDS", "3.0")),
         ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS=float(os.getenv("ROOMCAST_TELEPHONY_SESSION_TTL_SECONDS", "120")),
@@ -685,29 +686,35 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
         return Response(_stream(), mimetype=TELEPHONY_STREAM_PROFILE["mimetype"], headers=headers)
 
+    def _voice_prompt_xml(message: str) -> str:
+        voice = (app.config.get("ROOMCAST_TELEPHONY_VOICE") or "").strip()
+        voice_attr = f' voice="{escape(voice)}"' if voice else ""
+        return f"<Say{voice_attr}>{escape(message)}</Say>"
+
     def _voice_gather_xml(action_url: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="dtmf" numDigits="4" timeout="6" action="{escape(action_url)}" method="POST">
-    <Say>Welcome to NTC Newark WebCall. Please enter your pin now.</Say>
+    {_voice_prompt_xml("Welcome to NTC Newark WebCall. Please enter your four digit pin.")}
   </Gather>
-  <Say>Goodbye.</Say>
+  {_voice_prompt_xml("Goodbye.")}
 </Response>"""
 
     def _voice_invalid_pin_xml(retry_url: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>That pin was not accepted. Please try again.</Say>
+  {_voice_prompt_xml("Sorry, that pin was not accepted. Please try again.")}
   <Redirect method="POST">{escape(retry_url)}</Redirect>
 </Response>"""
 
-    def _voice_connect_xml(stream_url: str, continue_url: str | None = None) -> str:
+    def _voice_connect_xml(stream_url: str, continue_url: str | None = None, prompt: str | None = None) -> str:
+        prompt_xml = f"\n  {_voice_prompt_xml(prompt)}" if prompt else ""
         redirect_xml = ""
         if continue_url:
             redirect_xml = f'\n  <Redirect method="POST">{escape(continue_url)}</Redirect>'
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Connecting you now.</Say>
+{prompt_xml}
   <Play>{escape(stream_url)}</Play>
 {redirect_xml}
 </Response>"""
@@ -715,7 +722,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
     def _voice_goodbye_xml(message: str = "The line is no longer available. Goodbye.") -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>{escape(message)}</Say>
+  {_voice_prompt_xml(message)}
 </Response>"""
 
     def _is_admin() -> bool:
