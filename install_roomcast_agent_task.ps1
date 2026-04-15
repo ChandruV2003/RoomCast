@@ -13,7 +13,8 @@ param(
 [string]$PythonLauncher = "py",
 [string]$PythonSelector = "",
 [string]$PythonExecutable = "",
-[int]$PollIntervalSeconds = 1
+[int]$PollIntervalSeconds = 1,
+[switch]$EnforcePowerProfile = $true
 )
 
 $resolvedRepo = (Resolve-Path $RepoPath).Path
@@ -67,6 +68,11 @@ $action = New-ScheduledTaskAction `
 
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
+$guardianTrigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 1)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -78,6 +84,32 @@ $principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
     -LogonType Interactive `
     -RunLevel Highest
+
+if ($EnforcePowerProfile) {
+    $powerCommands = @(
+        @("/change", "standby-timeout-ac", "0"),
+        @("/change", "standby-timeout-dc", "0"),
+        @("/change", "hibernate-timeout-ac", "0"),
+        @("/change", "hibernate-timeout-dc", "0"),
+        @("/setacvalueindex", "scheme_current", "sub_buttons", "lidaction", "0"),
+        @("/setdcvalueindex", "scheme_current", "sub_buttons", "lidaction", "0"),
+        @("/setacvalueindex", "scheme_current", "sub_sleep", "hybridsleep", "0"),
+        @("/setdcvalueindex", "scheme_current", "sub_sleep", "hybridsleep", "0"),
+        @("/setacvalueindex", "scheme_current", "sub_sleep", "rtcwake", "1"),
+        @("/setdcvalueindex", "scheme_current", "sub_sleep", "rtcwake", "1"),
+        @("/setacvalueindex", "scheme_current", "2a737441-1930-4402-8d77-b2bebba308a3", "48e6b7a6-50f5-4782-a5d4-53bb8f07e226", "0"),
+        @("/setdcvalueindex", "scheme_current", "2a737441-1930-4402-8d77-b2bebba308a3", "48e6b7a6-50f5-4782-a5d4-53bb8f07e226", "0"),
+        @("/setactive", "scheme_current")
+    )
+
+    foreach ($powerCommand in $powerCommands) {
+        try {
+            & powercfg @powerCommand *> $null
+        } catch {
+            Write-Warning "powercfg $($powerCommand -join ' ') failed: $($_.Exception.Message)"
+        }
+    }
+}
 
 try {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
@@ -109,7 +141,7 @@ if (Test-Path $lockPath) {
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger @($logonTrigger, $startupTrigger) `
+    -Trigger @($logonTrigger, $startupTrigger, $guardianTrigger) `
     -Settings $settings `
     -Principal $principal `
     -Description "WebCall source agent for $HostSlug" `
