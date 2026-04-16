@@ -332,6 +332,7 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"<Stream", connect.data)
         self.assertIn(b"bidirectionalMode=\"rtp\"", connect.data)
         self.assertIn(b"bidirectionalCodec=\"PCMU\"", connect.data)
+        self.assertIn(b"bidirectionalSamplingRate=\"8000\"", connect.data)
         self.assertIn(b"wss://ntcnas.myftp.org/telephony/telnyx/telnyx-test-token/stream/", connect.data)
         self.assertNotIn(b"<Play>", connect.data)
 

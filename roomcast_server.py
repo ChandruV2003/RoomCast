@@ -195,6 +195,17 @@ def _linear16le_to_pcma(pcm_bytes: bytes) -> bytes:
     return bytes(payload)
 
 
+def _linear16le_to_l16be(pcm_bytes: bytes) -> bytes:
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if usable <= 0:
+        return b""
+    payload = bytearray(usable)
+    for offset in range(0, usable, 2):
+        payload[offset] = pcm_bytes[offset + 1]
+        payload[offset + 1] = pcm_bytes[offset]
+    return bytes(payload)
+
+
 class TelephonyPcmTranscoder:
     """Convert live PCM frames into a phone-friendly mono PCM16 stream."""
 
@@ -598,6 +609,8 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
     def _telnyx_stream_payload_from_pcm(pcm_frame: bytes) -> bytes:
         codec = (app.config.get("ROOMCAST_TELNYX_STREAM_CODEC") or "PCMU").strip().upper()
+        if codec == "L16":
+            return _linear16le_to_l16be(pcm_frame)
         if codec == "PCMA":
             return _linear16le_to_pcma(pcm_frame)
         return _linear16le_to_pcmu(pcm_frame)
@@ -885,6 +898,8 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         )
         pcm_buffer = bytearray()
         frame_seconds = max(0.02, int(app.config.get("ROOMCAST_TELNYX_STREAM_FRAME_MS", 20)) / 1000)
+        next_send_at = time.monotonic()
+        max_buffer_bytes = frame_pcm_bytes * 12
 
         try:
             while not runtime.stop_event.is_set():
@@ -904,20 +919,30 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                     break
                 if chunk:
                     pcm_buffer.extend(transcoder.transcode(chunk))
+                    if len(pcm_buffer) > max_buffer_bytes:
+                        del pcm_buffer[:-max_buffer_bytes]
 
                 while len(pcm_buffer) >= frame_pcm_bytes and not runtime.stop_event.is_set():
+                    sleep_for = next_send_at - time.monotonic()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
                     frame_pcm = bytes(pcm_buffer[:frame_pcm_bytes])
                     del pcm_buffer[:frame_pcm_bytes]
                     payload = _telnyx_stream_payload_from_pcm(frame_pcm)
                     runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) & 0xFFFF
                     runtime.rtp_timestamp = (runtime.rtp_timestamp + (len(frame_pcm) // 2)) & 0xFFFFFFFF
                     ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
+                    next_send_at = max(next_send_at + frame_seconds, time.monotonic())
 
                 if not chunk and len(pcm_buffer) < frame_pcm_bytes and not runtime.stop_event.is_set():
+                    sleep_for = next_send_at - time.monotonic()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
                     payload = _telnyx_stream_payload_from_pcm(silence_frame)
                     runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) & 0xFFFF
                     runtime.rtp_timestamp = (runtime.rtp_timestamp + (len(silence_frame) // 2)) & 0xFFFFFFFF
                     ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
+                    next_send_at = max(next_send_at + frame_seconds, time.monotonic())
         except ConnectionClosed:
             _telephony_log("telnyx-stream-send-closed", session_id=session_state.session_id, stream_id=runtime.stream_id)
         except Exception as exc:
