@@ -1528,7 +1528,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             project_name=_project_name(),
             listener_name=_listener_name(),
             room=_live_snapshot(),
-            stream_url=url_for("listen_live"),
+            stream_url=url_for("listen_live_wav"),
             status_url=url_for("live_status"),
         )
 
@@ -1545,7 +1545,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             project_name=_project_name(),
             listener_name=_listener_name(),
             room=snapshot,
-            stream_url=url_for("listen", room_slug=room_slug),
+            stream_url=url_for("listen_wav", room_slug=room_slug),
             status_url=url_for("room_status", room_slug=room_slug),
         )
 
@@ -1610,7 +1610,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             message=request.args.get("message"),
             error=request.args.get("error"),
             admin_stream_url=url_for(
-                "listen_live",
+                "listen_live_wav",
                 monitor=1,
                 room=((context.get("control_host") or {}).get("room_slug") or ""),
             ),
@@ -1844,6 +1844,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         }
         return Response(_stream(), mimetype=stream_profile["mimetype"], headers=headers)
 
+    @app.get("/listen/<room_slug>.wav", endpoint="listen_wav")
     @app.get("/listen/<room_slug>.mp3")
     def listen(room_slug: str):
         room = roomcast_store.get_room(room_slug)
@@ -1870,6 +1871,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 roomcast_store.end_listener_session(listener_session_id)
         return _audio_stream_response(_stream, _room_snapshot(room_slug))
 
+    @app.get("/listen/live.wav", endpoint="listen_live_wav")
     @app.get("/listen/live.mp3")
     def listen_live():
         admin_monitor = request.args.get("monitor") == "1" and _is_admin()

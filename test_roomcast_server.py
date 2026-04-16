@@ -88,12 +88,14 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"stream-player", response.data)
         self.assertIn(b"NTC Newark WebCall", response.data)
         self.assertNotIn(b"Enter PIN", response.data)
+        self.assertIn(b"/listen/live.wav", response.data)
 
     def test_direct_pin_route_redirects_into_room(self):
         response = self.client.get("/p/7070", follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"stream-player", response.data)
         self.assertIn(b"NTC Newark WebCall", response.data)
+        self.assertIn(b"/listen/live.wav", response.data)
 
     def test_listener_page_avoids_eager_stream_reload_loops(self):
         response = self.client.get("/p/7070", follow_redirects=True)
@@ -296,6 +298,9 @@ class RoomCastServerTests(unittest.TestCase):
         response = client.get("/listen/live.mp3")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, "audio/wav")
+        response_wav = client.get("/listen/live.wav")
+        self.assertEqual(response_wav.status_code, 200)
+        self.assertEqual(response_wav.mimetype, "audio/wav")
 
     def test_listen_requires_pin_authorization(self):
         response = self.client.get("/listen/meeting-hall.mp3")
