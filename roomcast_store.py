@@ -47,8 +47,8 @@ ROOM_SEEDS = {
 }
 
 LEGACY_AUDIO_DEFAULTS = {
-    "hp-pavilion-14m-ba1xx": ("Scarlett", "Microphone"),
-    "hp-envy-16-ad0xx": ("Scarlett", "Microphone"),
+    "hp-pavilion-14m-ba1xx": ("CQ", "Microphone"),
+    "hp-envy-16-ad0xx": ("SQ", "Microphone"),
     "leonovo-laptop-mv23gfqd": ("Microphone", ""),
 }
 

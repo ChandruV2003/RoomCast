@@ -72,13 +72,14 @@ $guardianTrigger = New-ScheduledTaskTrigger `
     -Once `
     -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes 1) `
-    -RepetitionDuration (New-TimeSpan -Days 1)
+    -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
+    -WakeToRun `
     -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
