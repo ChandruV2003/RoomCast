@@ -95,6 +95,13 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertIn(b"stream-player", response.data)
         self.assertIn(b"NTC Newark WebCall", response.data)
 
+    def test_listener_page_avoids_eager_stream_reload_loops(self):
+        response = self.client.get("/p/7070", follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"queueReconnect(", response.data)
+        self.assertNotIn(b"paintMeter(0, 0);\n      rebuildStreamUrl();", response.data)
+        self.assertNotIn(b"if (roomActive && audio.paused) {\n            refreshAudio();", response.data)
+
     def test_live_status_requires_pin_authorization(self):
         response = self.client.get("/api/live/status")
         self.assertEqual(response.status_code, 403)

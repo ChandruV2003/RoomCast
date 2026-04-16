@@ -2833,6 +2833,11 @@ ROOM_TEMPLATE = """
       let meterPeakPercent = 0;
       let meterPeakExpiresAt = 0;
       let autoplayBlocked = false;
+      let reconnectTimer = null;
+      let playbackAttemptInFlight = null;
+      let lastReconnectAt = 0;
+      let lastKnownLiveState = roomActive;
+      const baseStreamUrl = "{{ stream_url }}";
 
       function canUseMeter() {
         return true;
@@ -2840,8 +2845,35 @@ ROOM_TEMPLATE = """
 
       function rebuildStreamUrl() {
         audio.pause();
-        audio.src = "{{ stream_url }}" + "?v=" + Date.now();
+        audio.src = baseStreamUrl + "?v=" + Date.now();
         audio.load();
+      }
+
+      function clearReconnectTimer() {
+        if (!reconnectTimer) {
+          return;
+        }
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      function queueReconnect(reason, delay = 1200, forceReload = true) {
+        if (!roomActive || autoplayBlocked || reconnectTimer) {
+          return;
+        }
+        const now = Date.now();
+        const cooldown = Math.max(0, 1200 - (now - lastReconnectAt));
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          lastReconnectAt = Date.now();
+          if (!roomActive) {
+            return;
+          }
+          if (forceReload) {
+            rebuildStreamUrl();
+          }
+          startPlayback().catch(() => {});
+        }, Math.max(delay, cooldown));
       }
 
       function setChip(element, label, state) {
@@ -2918,44 +2950,44 @@ ROOM_TEMPLATE = """
       }
 
       async function startPlayback() {
+        if (playbackAttemptInFlight) {
+          return playbackAttemptInFlight;
+        }
         if (roomActive) {
           meterLabel.textContent = "Connecting";
           small.textContent = "Connecting audio...";
         }
-        try {
-          await audio.play();
-          connectMeter();
-          if (audioContext && audioContext.state === "suspended") {
-            await audioContext.resume();
+        playbackAttemptInFlight = (async () => {
+          try {
+            await audio.play();
+            connectMeter();
+            if (audioContext && audioContext.state === "suspended") {
+              await audioContext.resume();
+            }
+            autoplayBlocked = false;
+            playerShell.classList.remove("awaiting-gesture");
+            clearReconnectTimer();
+            small.textContent = "Connecting audio...";
+          } catch (error) {
+            if (roomActive) {
+              autoplayBlocked = true;
+              playerShell.classList.add("awaiting-gesture");
+              small.textContent = "Tap anywhere on this page if your browser blocks audio.";
+              return;
+            }
+            autoplayBlocked = false;
+            playerShell.classList.remove("awaiting-gesture");
+          } finally {
+            playbackAttemptInFlight = null;
           }
-          autoplayBlocked = false;
-          playerShell.classList.remove("awaiting-gesture");
-          small.textContent = "Connecting audio...";
-        } catch (error) {
-          if (roomActive) {
-            autoplayBlocked = true;
-            playerShell.classList.add("awaiting-gesture");
-            small.textContent = "Tap anywhere on this page if your browser blocks audio.";
-            return;
-          }
-          autoplayBlocked = false;
-          playerShell.classList.remove("awaiting-gesture");
-        }
+        })();
+        return playbackAttemptInFlight;
       }
 
       function resumePlaybackFromGesture() {
         if (!autoplayBlocked || !roomActive) {
           return;
         }
-        startPlayback().catch(() => {});
-      }
-
-      function refreshAudio() {
-        if (roomActive) {
-          meterLabel.textContent = "Connecting";
-          small.textContent = "Connecting audio...";
-        }
-        rebuildStreamUrl();
         startPlayback().catch(() => {});
       }
 
@@ -2980,9 +3012,14 @@ ROOM_TEMPLATE = """
             return;
           }
           const status = await response.json();
+          const liveNow = !!status.broadcasting || !!status.is_ingesting || !!status.desired_active;
+          const becameLive = liveNow && !lastKnownLiveState;
           setPublicState(status);
-          if (roomActive && audio.paused) {
-            refreshAudio();
+          lastKnownLiveState = liveNow;
+          if (becameLive) {
+            queueReconnect("became-live", 250, true);
+          } else if (roomActive && audio.paused && !autoplayBlocked && !playbackAttemptInFlight && !reconnectTimer) {
+            startPlayback().catch(() => {});
           }
           if (status.broadcasting) {
             if (audio.paused || audio.readyState < 2) {
@@ -2993,6 +3030,8 @@ ROOM_TEMPLATE = """
           } else if (status.is_ingesting || status.desired_active) {
             small.textContent = autoplayBlocked ? "Tap anywhere on this page if your browser blocks audio." : "Connecting audio...";
           } else {
+            clearReconnectTimer();
+            audio.pause();
             small.textContent = "Meeting not active right now. Leave this page open and it will reconnect when the audio begins.";
             paintMeter(0, 0);
             meterLabel.textContent = "Idle";
@@ -3025,9 +3064,9 @@ ROOM_TEMPLATE = """
           startPlayback().catch(() => {});
         }
       });
-      audio.addEventListener("ended", () => setTimeout(refreshAudio, 800));
-      audio.addEventListener("error", () => setTimeout(refreshAudio, 800));
-      audio.addEventListener("stalled", () => setTimeout(refreshAudio, 400));
+      audio.addEventListener("ended", () => queueReconnect("ended", 800, true));
+      audio.addEventListener("error", () => queueReconnect("error", 800, true));
+      audio.addEventListener("stalled", () => queueReconnect("stalled", 1500, true));
       audio.addEventListener("waiting", () => {
         meterLabel.textContent = "Connecting";
         setChip(broadcastChip, "Connecting audio", "warn");
@@ -3052,8 +3091,7 @@ ROOM_TEMPLATE = """
       });
 
       paintMeter(0, 0);
-      rebuildStreamUrl();
-      setInterval(pollStatus, 750);
+      setInterval(pollStatus, 1000);
       pollStatus();
       if (roomActive) {
         startPlayback().catch(() => {});
