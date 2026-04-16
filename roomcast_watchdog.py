@@ -131,6 +131,15 @@ def main():
                 severity=issue.severity,
                 message=f"[watchdog:{issue.code}] {issue.message}",
             )
+            store.record_event(
+                component="watchdog",
+                event_type=issue.code,
+                message=issue.message,
+                level=issue.severity,
+                room_slug=issue.room_slug,
+                host_slug=issue.host_slug,
+                details={"severity": issue.severity},
+            )
 
     if args.json:
         payload = {

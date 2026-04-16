@@ -29,6 +29,11 @@ from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+try:
+    from gunicorn.http.errors import NoMoreData as GunicornNoMoreData
+except Exception:  # pragma: no cover - only available in gunicorn runtime
+    GunicornNoMoreData = ()
+
 from roomcast_store import RoomCastStore
 
 try:
@@ -463,6 +468,41 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             details.append(f"{key}={text}")
         suffix = " " + " ".join(details) if details else ""
         app.logger.info("telephony[%s]%s", stage, suffix)
+
+    def _audit_log(
+        component: str,
+        event_type: str,
+        message: str,
+        *,
+        level: str = "info",
+        room_slug: str | None = None,
+        host_slug: str | None = None,
+        listener_session_id: int | None = None,
+        meeting_session_id: int | None = None,
+        **details,
+    ):
+        normalized_level = (level or "info").lower()
+        log_method = getattr(app.logger, normalized_level, app.logger.info)
+        suffix_parts = []
+        for key, value in details.items():
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                suffix_parts.append(f"{key}={text}")
+        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+        log_method("%s[%s] %s%s", component, event_type, message, suffix)
+        roomcast_store.record_event(
+            component=component,
+            event_type=event_type,
+            message=message,
+            level=normalized_level,
+            room_slug=room_slug,
+            host_slug=host_slug,
+            listener_session_id=listener_session_id,
+            meeting_session_id=meeting_session_id,
+            details=details or None,
+        )
 
     def _telephony_segment_target_bytes() -> int:
         seconds = max(1.0, float(app.config.get("ROOMCAST_TELEPHONY_SEGMENT_SECONDS", 2.5)))
@@ -1618,6 +1658,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         for host in _visible_hosts():
             if host["room_slug"] != room_slug:
                 _terminate_room_stream(host["room_slug"])
+        _audit_log(
+            "admin",
+            "call-started",
+            f"{_room_alias(room_slug, room_slug)} was started from the control panel.",
+            room_slug=room_slug,
+        )
         return redirect(url_for("admin_panel", room=room_slug, message=f"{_room_alias(room_slug, room_slug)} is starting."))
 
     @app.post("/admin/call/stop")
@@ -1637,6 +1683,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             )
         _sync_visible_meetings("admin-stop")
         _terminate_room_stream(room_slug)
+        _audit_log(
+            "admin",
+            "call-stopped",
+            f"{_room_alias(room_slug, room_slug)} was stopped from the control panel.",
+            room_slug=room_slug,
+        )
         return redirect(url_for("admin_panel", message=f"{_room_alias(room_slug, room_slug)} was stopped."))
 
     @app.post("/admin/call/schedule")
@@ -1653,6 +1705,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 device_order=host["device_order"],
             )
         _sync_visible_meetings("admin-schedule")
+        _audit_log("admin", "schedule-restored", "Automatic scheduling was restored for visible rooms.")
         return redirect(url_for("admin_panel", message="Automatic schedule restored."))
 
     @app.post("/admin/hosts/<slug>")
@@ -1689,6 +1742,18 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                         )
             roomcast_store.replace_host_schedule(slug, schedule_rows)
             _sync_visible_meetings("admin-settings")
+            _audit_log(
+                "admin",
+                "host-settings-updated",
+                f"{slug} settings were updated from the admin panel.",
+                room_slug=room_slug,
+                host_slug=slug,
+                manual_mode=manual_mode,
+                enabled=enabled,
+                capture_mode=host.get("capture_mode", "auto") if host else "auto",
+                device_order=device_order,
+                schedule_rows=len(schedule_rows),
+            )
             return redirect(url_for("admin_settings", room=room_slug, message=f"Updated {slug}"))
         except ValueError as exc:
             return redirect(url_for("admin_settings", room=room_slug, error=str(exc)))
@@ -2170,6 +2235,32 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
             }
         )
 
+    @app.post("/api/source/event")
+    def source_event():
+        payload = request.get_json(silent=False)
+        host_slug = (payload.get("host_slug") or "").strip()
+        token = (payload.get("token") or "").strip()
+        host = roomcast_store.get_host(host_slug, include_secret=True)
+        if not host or token != host["heartbeat_token"]:
+            return jsonify({"error": "unauthorized"}), 403
+
+        event_type = (payload.get("event_type") or "").strip() or "agent-event"
+        level = (payload.get("level") or "info").strip().lower() or "info"
+        message = (payload.get("message") or "").strip() or event_type
+        details = payload.get("details") or {}
+        if not isinstance(details, dict):
+            details = {"value": details}
+        _audit_log(
+            "agent",
+            event_type,
+            message,
+            level=level,
+            room_slug=host["room_slug"],
+            host_slug=host_slug,
+            **details,
+        )
+        return jsonify({"ok": True})
+
     @app.post("/api/source/ingest/<host_slug>")
     def source_ingest(host_slug: str):
         token = (request.args.get("token") or "").strip()
@@ -2179,14 +2270,42 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
 
         room_slug = host["room_slug"]
         stream_hub.start_broadcast(room_slug, host_slug)
+        _audit_log(
+            "source",
+            "ingest-connected",
+            f"{host_slug} connected its ingest stream.",
+            room_slug=room_slug,
+            host_slug=host_slug,
+        )
         try:
-            while True:
-                chunk = request.stream.read(INGEST_CHUNK_SIZE)
-                if not chunk:
-                    break
-                stream_hub.publish(room_slug, chunk)
+            try:
+                while True:
+                    chunk = request.stream.read(INGEST_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    stream_hub.publish(room_slug, chunk)
+            except GunicornNoMoreData:
+                app.logger.info(
+                    "source-ingest disconnected host_slug=%s room_slug=%s",
+                    host_slug,
+                    room_slug,
+                )
+                _audit_log(
+                    "source",
+                    "ingest-disconnected",
+                    f"{host_slug} disconnected its ingest stream.",
+                    room_slug=room_slug,
+                    host_slug=host_slug,
+                )
         finally:
             stream_hub.finish_broadcast(room_slug, host_slug)
+            _audit_log(
+                "source",
+                "ingest-finished",
+                f"{host_slug} finished its ingest stream.",
+                room_slug=room_slug,
+                host_slug=host_slug,
+            )
         return ("", 204)
 
     return app

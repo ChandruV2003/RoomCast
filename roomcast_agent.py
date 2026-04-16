@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
@@ -77,6 +78,8 @@ class RoomCastAgent:
         self.restart_not_before = 0.0
         self.stream_profile = "mp3"
         self.capture_mode = "auto"
+        self._event_throttle: dict[tuple[str, str], float] = {}
+        self._last_desired_active: bool | None = None
 
     def _silence_warning_message(self) -> str:
         return (
@@ -299,6 +302,44 @@ class RoomCastAgent:
         response.raise_for_status()
         return response.json()
 
+    def emit_event(
+        self,
+        event_type: str,
+        message: str,
+        *,
+        level: str = "info",
+        details: dict | None = None,
+        throttle_seconds: int = 0,
+    ):
+        normalized_level = (level or "info").lower()
+        log_method = getattr(logger, normalized_level, logger.info)
+        log_method("%s", message)
+
+        throttle_key = (event_type, message)
+        now = time.time()
+        if throttle_seconds > 0:
+            last_emitted = self._event_throttle.get(throttle_key, 0.0)
+            if now - last_emitted < throttle_seconds:
+                return
+            self._event_throttle[throttle_key] = now
+
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/source/event",
+                json={
+                    "host_slug": self.host_slug,
+                    "token": self.token,
+                    "event_type": event_type,
+                    "level": normalized_level,
+                    "message": message,
+                    "details": details or {},
+                },
+                timeout=5,
+            )
+            response.raise_for_status()
+        except Exception:
+            pass
+
     def _build_ffmpeg_command(self, ingest_url: str, device_name: str, stream_profile: str | None = None):
         active_stream_profile = (stream_profile or self.stream_profile or "mp3").strip().lower() or "mp3"
         profile = self._audio_profile(device_name, active_stream_profile, self.capture_mode)
@@ -407,10 +448,19 @@ class RoomCastAgent:
         self.silence_triggered = False
         command = self._build_ffmpeg_command(ingest_url, device_name, self.stream_profile)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        active_stream_profile = self.stream_profile
         if self._ffmpeg_log_handle:
             self._ffmpeg_log_handle.close()
         self._ffmpeg_log_handle = open(self.ffmpeg_log_path, "ab")
-        logger.info("Starting ingest for %s using %s", self.host_slug, device_name)
+        self.emit_event(
+            "ingest-started",
+            f"Starting ingest for {self.host_slug} using {device_name}.",
+            details={
+                "device_name": device_name,
+                "stream_profile": active_stream_profile,
+                "capture_mode": self.capture_mode,
+            },
+        )
         self.process = subprocess.Popen(
             command,
             cwd=self.repo_root,
@@ -425,7 +475,11 @@ class RoomCastAgent:
     def stop_ingest(self, *, reason: str | None = None):
         if not self._process_is_running():
             return
-        logger.info("Stopping ingest for %s", self.host_slug)
+        self.emit_event(
+            "ingest-stop-requested",
+            f"Stopping ingest for {self.host_slug}.",
+            details={"current_device": self.current_device, "reason": reason or ""},
+        )
         if reason:
             self.last_error = reason
         elif self.last_error == self._silence_warning_message():
@@ -449,9 +503,15 @@ class RoomCastAgent:
     def restart_ingest(self, ingest_url: str, device_name: str):
         if self.current_device == device_name and self._process_is_running():
             return
+        previous_device = self.current_device
         self.stop_ingest(reason=f"Switching to preferred input: {device_name}")
         self.restart_not_before = 0.0
         self.last_error = ""
+        self.emit_event(
+            "ingest-restart-requested",
+            f"{self.host_slug} is switching ingest to {device_name}.",
+            details={"previous_device": previous_device, "next_device": device_name},
+        )
         self.start_ingest(ingest_url, device_name)
 
     def write_status(self, server_reply=None):
@@ -472,10 +532,28 @@ class RoomCastAgent:
         while self.running:
             reply = None
             try:
+                previous_devices = list(self.cached_devices)
                 if not self.test_tone:
                     self.cached_devices = self.list_audio_devices()
+                if self.cached_devices != previous_devices:
+                    self.emit_event(
+                        "device-list-updated",
+                        f"{self.host_slug} reported a new device list.",
+                        details={"devices": self.cached_devices},
+                    )
                 reply = self.send_heartbeat()
                 self.desired_active = bool(reply.get("desired_active"))
+                if self._last_desired_active is None or self._last_desired_active != self.desired_active:
+                    self.emit_event(
+                        "desired-state-changed",
+                        f"{self.host_slug} desired_active is now {'on' if self.desired_active else 'off'}.",
+                        details={
+                            "desired_active": self.desired_active,
+                            "room_slug": reply.get("room_slug", ""),
+                            "room_label": reply.get("room_label", ""),
+                        },
+                    )
+                    self._last_desired_active = self.desired_active
                 self.stream_profile = (reply.get("stream_profile") or self.stream_profile or "mp3").strip().lower() or "mp3"
                 self.capture_mode = (reply.get("capture_mode") or self.capture_mode or "auto").strip().lower() or "auto"
                 if self.last_error != self._silence_warning_message():
@@ -494,22 +572,55 @@ class RoomCastAgent:
                             continue
                         if not device_name:
                             self.last_error = "No compatible input device was found."
+                            self.emit_event(
+                                "no-compatible-device",
+                                f"{self.host_slug} could not find a compatible input device.",
+                                level="warn",
+                                details={"devices": self.cached_devices},
+                                throttle_seconds=60,
+                            )
                         else:
                             self.start_ingest(reply["ingest_url"], device_name)
                     elif not device_name:
                         self.last_error = "No compatible input device was found."
+                        self.emit_event(
+                            "no-compatible-device",
+                            f"{self.host_slug} could not find a compatible input device.",
+                            level="warn",
+                            details={"devices": self.cached_devices},
+                            throttle_seconds=60,
+                        )
                     elif device_name != self.current_device:
                         self.restart_ingest(reply["ingest_url"], device_name)
                     elif self.process and self.process.poll() not in (None, 0):
                         self.last_error = f"ffmpeg exited with code {self.process.returncode}"
+                        self.emit_event(
+                            "ffmpeg-exited",
+                            f"{self.host_slug} ffmpeg exited with code {self.process.returncode}.",
+                            level="warn",
+                            details={"current_device": self.current_device},
+                            throttle_seconds=60,
+                        )
                 else:
                     self.stop_ingest()
             except Exception as exc:
                 self.last_error = str(exc)
-                logger.warning("RoomCast heartbeat cycle failed: %s", exc)
+                self.emit_event(
+                    "heartbeat-cycle-failed",
+                    f"RoomCast heartbeat cycle failed: {exc}",
+                    level="warn",
+                    throttle_seconds=60,
+                )
 
             if self.process and self.process.poll() not in (None, 0):
                 self.last_error = f"ffmpeg exited with code {self.process.returncode}"
+                self.emit_event(
+                    "ffmpeg-exited",
+                    f"{self.host_slug} ffmpeg exited with code {self.process.returncode}.",
+                    level="warn",
+                    details={"current_device": self.current_device},
+                    throttle_seconds=60,
+                )
                 self.process = None
 
             self.write_status(server_reply=reply)
@@ -545,7 +656,7 @@ def main():
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.FileHandler("roomcast-agent.log"),
+            RotatingFileHandler("roomcast-agent.log", maxBytes=2 * 1024 * 1024, backupCount=5),
             logging.StreamHandler(),
         ],
     )
@@ -572,12 +683,12 @@ def main():
     try:
         agent.acquire_instance_lock()
     except RuntimeError as exc:
-        logger.info("%s", exc)
+        agent.emit_event("agent-lock-conflict", str(exc), level="warn", throttle_seconds=60)
         return
 
     def _shutdown(signum, frame):
         del signum, frame
-        logger.info("Shutdown requested")
+        agent.emit_event("shutdown-requested", "Shutdown requested")
         agent.running = False
 
     signal.signal(signal.SIGINT, _shutdown)
@@ -585,8 +696,10 @@ def main():
         signal.signal(signal.SIGTERM, _shutdown)
 
     try:
+        agent.emit_event("agent-started", f"RoomCast agent started for {agent.host_slug}.")
         agent.run_forever()
     finally:
+        agent.emit_event("agent-stopped", f"RoomCast agent stopped for {agent.host_slug}.")
         agent.release_instance_lock()
 
 

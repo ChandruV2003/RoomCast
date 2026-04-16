@@ -106,6 +106,10 @@ class RoomCastStoreTests(unittest.TestCase):
         self.store.end_listener_session(session_id)
         active_after = self.store.list_listener_sessions("meeting-hall", active_only=True)
         self.assertEqual(active_after, [])
+        events = self.store.list_recent_events(room_slug="meeting-hall", component="listener", limit=4)
+        event_types = [event["event_type"] for event in events]
+        self.assertIn("listener-joined", event_types)
+        self.assertIn("listener-left", event_types)
 
     def test_sync_meeting_state_closes_active_listeners_when_meeting_ends(self):
         self.store.sync_meeting_state(
@@ -191,6 +195,37 @@ class RoomCastStoreTests(unittest.TestCase):
         self.assertEqual(report["listener_count"], 1)
         self.assertEqual(report["incident_count"], 1)
         self.assertEqual(report["listeners"][0]["participant_label"], "Web 127.0.0.1")
+
+    def test_record_heartbeat_logs_runtime_changes(self):
+        self.store.record_heartbeat(
+            "hp-pavilion-14m-ba1xx",
+            current_device="Scarlett Solo 4th Gen",
+            devices=["Scarlett Solo 4th Gen"],
+            is_ingesting=False,
+            last_error="",
+            desired_active=False,
+            stream_profile="wav_pcm24",
+            stream_channels=2,
+            sample_rate_hz=48000,
+            sample_bits=24,
+        )
+        self.store.record_heartbeat(
+            "hp-pavilion-14m-ba1xx",
+            current_device="Scarlett Solo 4th Gen",
+            devices=["Scarlett Solo 4th Gen", "Stereo Mix"],
+            is_ingesting=True,
+            last_error="Sample warning",
+            desired_active=False,
+            stream_profile="wav_pcm24",
+            stream_channels=2,
+            sample_rate_hz=48000,
+            sample_bits=24,
+        )
+        events = self.store.list_recent_events(room_slug="meeting-hall", host_slug="hp-pavilion-14m-ba1xx", limit=10)
+        event_types = {event["event_type"] for event in events}
+        self.assertIn("device-list-changed", event_types)
+        self.assertIn("ingest-started", event_types)
+        self.assertIn("runtime-error", event_types)
 
 
 if __name__ == "__main__":

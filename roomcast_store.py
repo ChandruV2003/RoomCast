@@ -229,6 +229,33 @@ class RoomCastStore:
 
                 CREATE INDEX IF NOT EXISTS idx_meeting_incidents_room_time
                 ON meeting_incidents(room_slug, occurred_at DESC);
+
+                CREATE TABLE IF NOT EXISTS room_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurred_at TEXT NOT NULL,
+                    component TEXT NOT NULL,
+                    level TEXT NOT NULL DEFAULT 'info',
+                    event_type TEXT NOT NULL,
+                    room_slug TEXT,
+                    host_slug TEXT,
+                    listener_session_id INTEGER,
+                    meeting_session_id INTEGER,
+                    message TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(room_slug) REFERENCES rooms(slug) ON DELETE SET NULL,
+                    FOREIGN KEY(host_slug) REFERENCES hosts(slug) ON DELETE SET NULL,
+                    FOREIGN KEY(listener_session_id) REFERENCES listener_sessions(id) ON DELETE SET NULL,
+                    FOREIGN KEY(meeting_session_id) REFERENCES meeting_sessions(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_room_events_time
+                ON room_events(occurred_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_room_events_room_time
+                ON room_events(room_slug, occurred_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_room_events_host_time
+                ON room_events(host_slug, occurred_at DESC);
                 """
             )
             host_columns = {row["name"] for row in connection.execute("PRAGMA table_info(hosts)").fetchall()}
@@ -396,6 +423,125 @@ class RoomCastStore:
                     host["slug"],
                 ),
             )
+
+    def _insert_event(
+        self,
+        connection,
+        *,
+        component: str,
+        event_type: str,
+        message: str,
+        level: str = "info",
+        room_slug: str | None = None,
+        host_slug: str | None = None,
+        listener_session_id: int | None = None,
+        meeting_session_id: int | None = None,
+        details: dict | None = None,
+        occurred_at: str | None = None,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            INSERT INTO room_events (
+                occurred_at,
+                component,
+                level,
+                event_type,
+                room_slug,
+                host_slug,
+                listener_session_id,
+                meeting_session_id,
+                message,
+                details_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                occurred_at or _utc_now(),
+                (component or "").strip() or "system",
+                (level or "info").strip() or "info",
+                (event_type or "").strip() or "event",
+                room_slug,
+                host_slug,
+                listener_session_id,
+                meeting_session_id,
+                (message or "").strip(),
+                json.dumps(details or {}, sort_keys=True),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def record_event(
+        self,
+        *,
+        component: str,
+        event_type: str,
+        message: str,
+        level: str = "info",
+        room_slug: str | None = None,
+        host_slug: str | None = None,
+        listener_session_id: int | None = None,
+        meeting_session_id: int | None = None,
+        details: dict | None = None,
+    ) -> int:
+        with self._connect() as connection:
+            return self._insert_event(
+                connection,
+                component=component,
+                event_type=event_type,
+                message=message,
+                level=level,
+                room_slug=room_slug,
+                host_slug=host_slug,
+                listener_session_id=listener_session_id,
+                meeting_session_id=meeting_session_id,
+                details=details,
+            )
+
+    def list_recent_events(
+        self,
+        *,
+        limit: int = 100,
+        room_slug: str | None = None,
+        host_slug: str | None = None,
+        component: str | None = None,
+    ):
+        query = """
+            SELECT id, occurred_at, component, level, event_type, room_slug, host_slug,
+                   listener_session_id, meeting_session_id, message, details_json
+            FROM room_events
+            WHERE 1 = 1
+        """
+        params: list[object] = []
+        if room_slug:
+            query += " AND room_slug = ?"
+            params.append(room_slug)
+        if host_slug:
+            query += " AND host_slug = ?"
+            params.append(host_slug)
+        if component:
+            query += " AND component = ?"
+            params.append(component)
+        query += " ORDER BY occurred_at DESC LIMIT ?"
+        params.append(limit)
+
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "occurred_at": row["occurred_at"],
+                    "component": row["component"],
+                    "level": row["level"],
+                    "event_type": row["event_type"],
+                    "room_slug": row["room_slug"],
+                    "host_slug": row["host_slug"],
+                    "listener_session_id": row["listener_session_id"],
+                    "meeting_session_id": row["meeting_session_id"],
+                    "message": row["message"],
+                    "details": json.loads(row["details_json"] or "{}"),
+                }
+                for row in rows
+            ]
 
     def _schedules_for_host(self, connection, slug: str):
         rows = connection.execute(
@@ -733,11 +879,36 @@ class RoomCastStore:
                     timestamp,
                 ),
             )
-            return int(cursor.lastrowid)
+            session_id = int(cursor.lastrowid)
+            self._insert_event(
+                connection,
+                component="listener",
+                event_type="listener-joined",
+                message=f"{(participant_label or '').strip() or 'Anonymous listener'} joined via {channel}.",
+                room_slug=room_slug,
+                listener_session_id=session_id,
+                details={
+                    "channel": (channel or "").strip(),
+                    "participant_label": (participant_label or "").strip() or "Anonymous listener",
+                    "participant_key": (participant_key or "").strip(),
+                    "ip_address": (ip_address or "").strip(),
+                    "user_agent": (user_agent or "").strip(),
+                },
+                occurred_at=timestamp,
+            )
+            return session_id
 
     def end_listener_session(self, session_id: int):
         with self._connect() as connection:
-            connection.execute(
+            row = connection.execute(
+                """
+                SELECT room_slug, channel, participant_label, participant_key, ip_address, user_agent
+                FROM listener_sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            cursor = connection.execute(
                 """
                 UPDATE listener_sessions
                 SET left_at = ?
@@ -745,6 +916,22 @@ class RoomCastStore:
                 """,
                 (_utc_now(), session_id),
             )
+            if row and cursor.rowcount:
+                self._insert_event(
+                    connection,
+                    component="listener",
+                    event_type="listener-left",
+                    message=f"{row['participant_label']} left {row['channel']}.",
+                    room_slug=row["room_slug"],
+                    listener_session_id=session_id,
+                    details={
+                        "channel": row["channel"],
+                        "participant_label": row["participant_label"],
+                        "participant_key": row["participant_key"],
+                        "ip_address": row["ip_address"],
+                        "user_agent": row["user_agent"],
+                    },
+                )
 
     def _end_active_listener_sessions(self, connection, room_slug: str, ended_at: str):
         connection.execute(
@@ -838,7 +1025,15 @@ class RoomCastStore:
         with self._connect() as connection:
             prior = connection.execute(
                 """
-                SELECT rooms.slug AS room_slug, source_runtime.last_error
+                SELECT rooms.slug AS room_slug,
+                       source_runtime.current_device,
+                       source_runtime.device_list_json,
+                       source_runtime.is_ingesting,
+                       source_runtime.last_error,
+                       source_runtime.stream_profile,
+                       source_runtime.stream_channels,
+                       source_runtime.sample_rate_hz,
+                       source_runtime.sample_bits
                 FROM hosts
                 JOIN rooms ON rooms.slug = hosts.room_slug
                 LEFT JOIN source_runtime ON source_runtime.host_slug = hosts.slug
@@ -890,13 +1085,111 @@ class RoomCastStore:
                 ),
             )
 
-            if prior and last_error and last_error != (prior["last_error"] or ""):
+            normalized_devices = _dedupe_list(devices)
+            previous_devices = _json_list(prior["device_list_json"]) if prior else []
+            if prior and normalized_devices != previous_devices:
+                self._insert_event(
+                    connection,
+                    component="agent",
+                    event_type="device-list-changed",
+                    message=f"{host_slug} reported an updated device list.",
+                    room_slug=prior["room_slug"],
+                    host_slug=host_slug,
+                    details={"devices": normalized_devices},
+                    occurred_at=timestamp,
+                )
+
+            previous_device = (prior["current_device"] or "") if prior else ""
+            current_device_value = (current_device or "").strip()
+            if prior and current_device_value != previous_device:
+                event_type = "source-device-cleared" if not current_device_value else "source-device-changed"
+                message = (
+                    f"{host_slug} cleared its current input device."
+                    if not current_device_value
+                    else f"{host_slug} switched to {current_device_value}."
+                )
+                self._insert_event(
+                    connection,
+                    component="agent",
+                    event_type=event_type,
+                    message=message,
+                    room_slug=prior["room_slug"],
+                    host_slug=host_slug,
+                    details={"previous_device": previous_device, "current_device": current_device_value},
+                    occurred_at=timestamp,
+                )
+
+            previous_ingesting = bool(prior["is_ingesting"]) if prior and prior["is_ingesting"] is not None else None
+            if prior and previous_ingesting != bool(is_ingesting):
+                self._insert_event(
+                    connection,
+                    component="agent",
+                    event_type="ingest-started" if is_ingesting else "ingest-stopped",
+                    message=(
+                        f"{host_slug} started publishing audio."
+                        if is_ingesting
+                        else f"{host_slug} stopped publishing audio."
+                    ),
+                    room_slug=prior["room_slug"],
+                    host_slug=host_slug,
+                    details={"current_device": current_device_value},
+                    occurred_at=timestamp,
+                )
+
+            if prior and any(
+                [
+                    (prior["stream_profile"] or "") != (stream_profile or "").strip(),
+                    int(prior["stream_channels"] or 0) != max(1, int(stream_channels or 1)),
+                    int(prior["sample_rate_hz"] or 0) != max(8000, int(sample_rate_hz or 48000)),
+                    int(prior["sample_bits"] or 0) != max(0, int(sample_bits or 0)),
+                ]
+            ):
+                self._insert_event(
+                    connection,
+                    component="agent",
+                    event_type="stream-format-changed",
+                    message=f"{host_slug} changed its stream format.",
+                    room_slug=prior["room_slug"],
+                    host_slug=host_slug,
+                    details={
+                        "stream_profile": (stream_profile or "").strip(),
+                        "stream_channels": max(1, int(stream_channels or 1)),
+                        "sample_rate_hz": max(8000, int(sample_rate_hz or 48000)),
+                        "sample_bits": max(0, int(sample_bits or 0)),
+                    },
+                    occurred_at=timestamp,
+                )
+
+            previous_error = (prior["last_error"] or "") if prior else ""
+            normalized_error = (last_error or "").strip()
+            if prior and normalized_error and normalized_error != previous_error:
                 connection.execute(
                     """
                     INSERT INTO meeting_incidents (room_slug, host_slug, occurred_at, severity, message)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (prior["room_slug"], host_slug, timestamp, "warn", last_error),
+                    (prior["room_slug"], host_slug, timestamp, "warn", normalized_error),
+                )
+                self._insert_event(
+                    connection,
+                    component="agent",
+                    event_type="runtime-error",
+                    message=normalized_error,
+                    level="warn",
+                    room_slug=prior["room_slug"],
+                    host_slug=host_slug,
+                    occurred_at=timestamp,
+                )
+            elif prior and previous_error and not normalized_error:
+                self._insert_event(
+                    connection,
+                    component="agent",
+                    event_type="runtime-error-cleared",
+                    message=f"{host_slug} cleared its last runtime error.",
+                    room_slug=prior["room_slug"],
+                    host_slug=host_slug,
+                    details={"previous_error": previous_error},
+                    occurred_at=timestamp,
                 )
 
     def record_incident(
@@ -938,6 +1231,16 @@ class RoomCastStore:
                 """,
                 (room_slug, host_slug, timestamp, severity, normalized_message),
             )
+            self._insert_event(
+                connection,
+                component="watchdog" if normalized_message.startswith("[watchdog:") else "incident",
+                event_type="incident-recorded",
+                message=normalized_message,
+                level=severity,
+                room_slug=room_slug,
+                host_slug=host_slug,
+                occurred_at=timestamp,
+            )
 
     def sync_meeting_state(self, room_slug: str, *, active: bool, host_slug: str | None = None, trigger_mode: str = "system", actor: str = ""):
         timestamp = _utc_now()
@@ -965,6 +1268,20 @@ class RoomCastStore:
                             (timestamp, actor or trigger_mode, row["id"]),
                         )
                         self._end_active_listener_sessions(connection, row["room_slug"], timestamp)
+                        self._insert_event(
+                            connection,
+                            component="meeting",
+                            event_type="meeting-preempted",
+                            message=f"{row['room_slug']} was ended because another room became active.",
+                            room_slug=row["room_slug"],
+                            meeting_session_id=int(row["id"]),
+                            details={
+                                "next_room_slug": room_slug,
+                                "trigger_mode": trigger_mode,
+                                "actor": actor or trigger_mode,
+                            },
+                            occurred_at=timestamp,
+                        )
                 if current:
                     return int(current["id"])
 
@@ -975,7 +1292,19 @@ class RoomCastStore:
                     """,
                     (room_slug, host_slug, timestamp, trigger_mode, actor or trigger_mode),
                 )
-                return int(cursor.lastrowid)
+                meeting_id = int(cursor.lastrowid)
+                self._insert_event(
+                    connection,
+                    component="meeting",
+                    event_type="meeting-started",
+                    message=f"{room_slug} became active.",
+                    room_slug=room_slug,
+                    host_slug=host_slug,
+                    meeting_session_id=meeting_id,
+                    details={"trigger_mode": trigger_mode, "actor": actor or trigger_mode},
+                    occurred_at=timestamp,
+                )
+                return meeting_id
 
             if current:
                 connection.execute(
@@ -987,6 +1316,17 @@ class RoomCastStore:
                     (timestamp, actor or trigger_mode, current["id"]),
                 )
                 self._end_active_listener_sessions(connection, room_slug, timestamp)
+                self._insert_event(
+                    connection,
+                    component="meeting",
+                    event_type="meeting-stopped",
+                    message=f"{room_slug} was ended.",
+                    room_slug=room_slug,
+                    host_slug=host_slug,
+                    meeting_session_id=int(current["id"]),
+                    details={"trigger_mode": trigger_mode, "actor": actor or trigger_mode},
+                    occurred_at=timestamp,
+                )
                 return int(current["id"])
 
             return None

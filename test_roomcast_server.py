@@ -252,6 +252,28 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertEqual(payload["capture_mode"], "stereo")
         self.assertEqual(payload["stream_profile"], self.app.config["ROOMCAST_STREAM_PROFILE"])
 
+    def test_source_event_endpoint_records_agent_event(self):
+        host = self.app.roomcast_store.get_host("hp-pavilion-14m-ba1xx", include_secret=True)
+        response = self.client.post(
+            "/api/source/event",
+            json={
+                "host_slug": host["slug"],
+                "token": host["heartbeat_token"],
+                "event_type": "agent-started",
+                "level": "info",
+                "message": "Agent started.",
+                "details": {"device_count": 2},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        events = self.app.roomcast_store.list_recent_events(
+            host_slug="hp-pavilion-14m-ba1xx",
+            component="agent",
+            limit=5,
+        )
+        self.assertEqual(events[0]["event_type"], "agent-started")
+        self.assertEqual(events[0]["details"]["device_count"], 2)
+
     def test_listen_live_uses_wav_mimetype_when_configured(self):
         app = create_app(
             {
