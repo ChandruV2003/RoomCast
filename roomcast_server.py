@@ -190,38 +190,6 @@ def _linear16le_to_pcma(pcm_bytes: bytes) -> bytes:
     return bytes(payload)
 
 
-def _telnyx_rtp_payload_type(codec: str) -> int:
-    normalized = (codec or "PCMU").strip().upper()
-    if normalized == "PCMA":
-        return 8
-    if normalized == "G722":
-        return 9
-    return 0
-
-
-def _rtp_packet(
-    payload: bytes,
-    *,
-    payload_type: int,
-    sequence_number: int,
-    timestamp: int,
-    ssrc: int,
-    marker: bool = False,
-) -> bytes:
-    version = 2
-    first_byte = version << 6
-    second_byte = (0x80 if marker else 0x00) | (payload_type & 0x7F)
-    header = struct.pack(
-        "!BBHII",
-        first_byte,
-        second_byte,
-        sequence_number & 0xFFFF,
-        timestamp & 0xFFFFFFFF,
-        ssrc & 0xFFFFFFFF,
-    )
-    return header + payload
-
-
 class TelephonyPcmTranscoder:
     """Convert live PCM frames into a phone-friendly mono PCM16 stream."""
 
@@ -869,7 +837,6 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         sample_rate = max(8000, int(app.config.get("ROOMCAST_TELNYX_STREAM_SAMPLE_RATE", 8000)))
         frame_pcm_bytes = _telnyx_stream_frame_bytes()
         silence_frame = b"\x00" * frame_pcm_bytes
-        rtp_payload_type = _telnyx_rtp_payload_type(codec)
         transcoder = TelephonyPcmTranscoder(
             source_channels=descriptor.get("channels", 1),
             source_rate_hz=descriptor.get("sample_rate_hz", 48000),
@@ -902,29 +869,15 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                     frame_pcm = bytes(pcm_buffer[:frame_pcm_bytes])
                     del pcm_buffer[:frame_pcm_bytes]
                     payload = _telnyx_stream_payload_from_pcm(frame_pcm)
-                    packet = _rtp_packet(
-                        payload,
-                        payload_type=rtp_payload_type,
-                        sequence_number=runtime.rtp_sequence_number,
-                        timestamp=runtime.rtp_timestamp,
-                        ssrc=runtime.rtp_ssrc,
-                    )
                     runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) & 0xFFFF
                     runtime.rtp_timestamp = (runtime.rtp_timestamp + (len(frame_pcm) // 2)) & 0xFFFFFFFF
-                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(packet).decode("ascii")}}))
+                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
 
                 if not chunk and len(pcm_buffer) < frame_pcm_bytes and not runtime.stop_event.is_set():
                     payload = _telnyx_stream_payload_from_pcm(silence_frame)
-                    packet = _rtp_packet(
-                        payload,
-                        payload_type=rtp_payload_type,
-                        sequence_number=runtime.rtp_sequence_number,
-                        timestamp=runtime.rtp_timestamp,
-                        ssrc=runtime.rtp_ssrc,
-                    )
                     runtime.rtp_sequence_number = (runtime.rtp_sequence_number + 1) & 0xFFFF
                     runtime.rtp_timestamp = (runtime.rtp_timestamp + (len(silence_frame) // 2)) & 0xFFFFFFFF
-                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(packet).decode("ascii")}}))
+                    ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(payload).decode("ascii")}}))
         except ConnectionClosed:
             _telephony_log("telnyx-stream-send-closed", session_id=session_state.session_id, stream_id=runtime.stream_id)
         except Exception as exc:

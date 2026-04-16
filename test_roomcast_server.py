@@ -3,7 +3,6 @@ import hmac
 import os
 import queue
 import sqlite3
-import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,8 +16,6 @@ from roomcast_server import (
     LISTENER_QUEUE_MAXSIZE,
     RoomStreamHub,
     TelephonyPcmTranscoder,
-    _rtp_packet,
-    _telnyx_rtp_payload_type,
     create_app,
 )
 
@@ -63,22 +60,6 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertGreater(len(converted), 0)
         self.assertEqual(len(converted) % 2, 0)
         self.assertNotEqual(converted, b"\x00" * len(converted))
-
-    def test_rtp_packet_uses_standard_pcmu_payload_type(self):
-        packet = _rtp_packet(
-            b"\xff" * 160,
-            payload_type=_telnyx_rtp_payload_type("PCMU"),
-            sequence_number=1234,
-            timestamp=5678,
-            ssrc=9012,
-        )
-        version_and_flags, payload_info, sequence_number, timestamp, ssrc = struct.unpack("!BBHII", packet[:12])
-        self.assertEqual(version_and_flags >> 6, 2)
-        self.assertEqual(payload_info & 0x7F, 0)
-        self.assertEqual(sequence_number, 1234)
-        self.assertEqual(timestamp, 5678)
-        self.assertEqual(ssrc, 9012)
-        self.assertEqual(len(packet), 172)
 
     def test_join_flow_redirects_to_room_page(self):
         response = self.client.post(
