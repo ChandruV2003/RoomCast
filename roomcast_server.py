@@ -426,6 +426,20 @@ def _apply_pcm16le_gain(pcm_bytes: bytes, gain: float) -> bytes:
     return bytes(output)
 
 
+def _limit_pcm16le_peak(pcm_bytes: bytes, *, peak_limit: int = 30000) -> bytes:
+    if not pcm_bytes:
+        return b""
+    if audioop is not None:
+        peak = audioop.max(pcm_bytes, 2)
+    else:
+        peak = 0
+        for offset in range(0, len(pcm_bytes), 2):
+            peak = max(peak, abs(struct.unpack_from("<h", pcm_bytes, offset)[0]))
+    if peak > peak_limit:
+        return _apply_pcm16le_gain(pcm_bytes, float(peak_limit) / float(peak))
+    return pcm_bytes
+
+
 def _signal_percent_from_db(db_value: float | None) -> float:
     if db_value is None:
         return 0.0
@@ -495,17 +509,7 @@ class TelephonyPcmTranscoder:
         self._gain_state = 1.0
 
     def _limit_peak(self, pcm_bytes: bytes, *, peak_limit: int = 30000) -> bytes:
-        if not pcm_bytes:
-            return b""
-        if audioop is not None:
-            peak = audioop.max(pcm_bytes, 2)
-        else:
-            peak = 0
-            for offset in range(0, len(pcm_bytes), 2):
-                peak = max(peak, abs(struct.unpack_from("<h", pcm_bytes, offset)[0]))
-        if peak > peak_limit:
-            return _apply_pcm16le_gain(pcm_bytes, float(peak_limit) / float(peak))
-        return pcm_bytes
+        return _limit_pcm16le_peak(pcm_bytes, peak_limit=peak_limit)
 
     def _mono_weights(self) -> tuple[float, float]:
         if self.mono_mix in {"mix", "sum", "average", "center"}:
@@ -614,6 +618,7 @@ class PcmStreamTranscoder:
         output_channels: int,
         output_rate_hz: int,
         output_bits_per_sample: int,
+        gain_db: float = 0.0,
     ):
         self.source_channels = max(1, int(source_channels or 1))
         self.source_rate_hz = max(8000, int(source_rate_hz or 48000))
@@ -627,6 +632,15 @@ class PcmStreamTranscoder:
         self._carry = b""
         self._rate_state = None
         self._sample_accumulator = 0
+        self.gain_db = float(gain_db or 0.0)
+
+    def _apply_output_processing(self, pcm_bytes: bytes) -> bytes:
+        if not pcm_bytes:
+            return b""
+        if self.output_bits_per_sample != 16 or abs(self.gain_db) <= 0.01:
+            return pcm_bytes
+        shaped = _apply_pcm16le_gain(pcm_bytes, math.pow(10.0, self.gain_db / 20.0))
+        return _limit_pcm16le_peak(shaped)
 
     def transcode(self, chunk: bytes) -> bytes:
         if not chunk:
@@ -666,7 +680,7 @@ class PcmStreamTranscoder:
                 )
             if self._source_width != self._output_width:
                 working = audioop.lin2lin(working, self._source_width, self._output_width)
-            return working
+            return self._apply_output_processing(working)
 
         output = bytearray()
         for offset in range(0, usable, self._frame_width):
@@ -702,7 +716,7 @@ class PcmStreamTranscoder:
                 elif self.output_bits_per_sample == 24:
                     scaled = max(-(1 << 23), min((1 << 23) - 1, sample_value))
                     output.extend(int(scaled).to_bytes(3, "little", signed=True))
-        return bytes(output)
+        return self._apply_output_processing(bytes(output))
 
 
 @dataclass
@@ -960,6 +974,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         ROOMCAST_TELNYX_DEBUG_TAP_MAX_SECONDS=float(os.getenv("ROOMCAST_TELNYX_DEBUG_TAP_MAX_SECONDS", "300")),
         ROOMCAST_TELNYX_SMS_LOG_PATH=os.getenv("ROOMCAST_TELNYX_SMS_LOG_PATH", "/app/data/telnyx-sms-webhooks.jsonl"),
         ROOMCAST_STREAM_PROFILE=os.getenv("ROOMCAST_STREAM_PROFILE", "mp3"),
+        ROOMCAST_BROWSER_GAIN_DB=float(os.getenv("ROOMCAST_BROWSER_GAIN_DB", "0")),
         ROOMCAST_HLS_ENABLED=os.getenv("ROOMCAST_HLS_ENABLED", "1"),
         ROOMCAST_HLS_SEGMENT_SECONDS=float(os.getenv("ROOMCAST_HLS_SEGMENT_SECONDS", "1.0")),
         ROOMCAST_HLS_PLAYLIST_LENGTH=int(os.getenv("ROOMCAST_HLS_PLAYLIST_LENGTH", "6")),
@@ -1645,10 +1660,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         source_descriptor = _stream_descriptor(snapshot)
         target_descriptor = dict(BROWSER_STREAM_PROFILE)
         transcoder = None
+        browser_gain_db = float(app.config.get("ROOMCAST_BROWSER_GAIN_DB", 0.0))
         if (
             int(source_descriptor.get("channels") or 1) != target_descriptor["channels"]
             or int(source_descriptor.get("sample_rate_hz") or 48000) != target_descriptor["sample_rate_hz"]
             or int(source_descriptor.get("bits_per_sample") or 24) != target_descriptor["bits_per_sample"]
+            or abs(browser_gain_db) > 0.01
         ):
             transcoder = PcmStreamTranscoder(
                 source_channels=int(source_descriptor.get("channels") or 1),
@@ -1657,6 +1674,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 output_channels=target_descriptor["channels"],
                 output_rate_hz=target_descriptor["sample_rate_hz"],
                 output_bits_per_sample=target_descriptor["bits_per_sample"],
+                gain_db=browser_gain_db,
             )
 
         ffmpeg_cmd = [
@@ -1724,8 +1742,13 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                     payload = transcoder.transcode(raw_chunk) if transcoder is not None else raw_chunk
                     if not payload:
                         return
-                    process.stdin.write(payload)
-                    process.stdin.flush()
+                    try:
+                        process.stdin.write(payload)
+                        process.stdin.flush()
+                    except (BrokenPipeError, ValueError, OSError) as exc:
+                        state.last_error = f"ffmpeg input closed: {exc}"
+                        state.stop_event.set()
+                        return
                     if not state.ready_event.is_set() and os.path.exists(state.playlist_path) and os.path.getsize(state.playlist_path) > 0:
                         state.ready_event.set()
 
@@ -3642,10 +3665,12 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
         source_descriptor = _stream_descriptor(snapshot)
         stream_profile = _browser_stream_descriptor(snapshot)
         transcoder = None
+        browser_gain_db = float(app.config.get("ROOMCAST_BROWSER_GAIN_DB", 0.0))
         if (
             int(source_descriptor.get("channels") or 1) != stream_profile["channels"]
             or int(source_descriptor.get("sample_rate_hz") or 48000) != stream_profile["sample_rate_hz"]
             or int(source_descriptor.get("bits_per_sample") or 24) != stream_profile["bits_per_sample"]
+            or abs(browser_gain_db) > 0.01
         ):
             transcoder = PcmStreamTranscoder(
                 source_channels=int(source_descriptor.get("channels") or 1),
@@ -3654,6 +3679,7 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 output_channels=stream_profile["channels"],
                 output_rate_hz=stream_profile["sample_rate_hz"],
                 output_bits_per_sample=stream_profile["bits_per_sample"],
+                gain_db=browser_gain_db,
             )
 
         browser_chunk_bytes = max(

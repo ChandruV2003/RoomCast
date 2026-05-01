@@ -179,6 +179,34 @@ class RoomCastServerTests(unittest.TestCase):
         self.assertEqual(len(converted) % 4, 0)
         self.assertNotEqual(converted, b"\x00" * len(converted))
 
+    def test_browser_transcoder_applies_configured_gain_with_peak_limit(self):
+        transcoder = PcmStreamTranscoder(
+            source_channels=2,
+            source_rate_hz=48000,
+            bits_per_sample=16,
+            output_channels=2,
+            output_rate_hz=48000,
+            output_bits_per_sample=16,
+            gain_db=12.0,
+        )
+        low_level_stereo = (
+            int(600).to_bytes(2, "little", signed=True)
+            + int(300).to_bytes(2, "little", signed=True)
+        ) * 480
+        converted = transcoder.transcode(low_level_stereo)
+        self.assertGreater(_pcm16_rms(converted), _pcm16_rms(low_level_stereo) * 3)
+
+        loud_stereo = (
+            int(32000).to_bytes(2, "little", signed=True)
+            + int(32000).to_bytes(2, "little", signed=True)
+        ) * 480
+        limited = transcoder.transcode(loud_stereo)
+        peak = max(
+            abs(int.from_bytes(limited[offset:offset + 2], "little", signed=True))
+            for offset in range(0, len(limited), 2)
+        )
+        self.assertLessEqual(peak, 30000)
+
     def test_telnyx_rtp_packet_wraps_codec_payload(self):
         payload = b"encoded"
         packet = _rtp_packet(
