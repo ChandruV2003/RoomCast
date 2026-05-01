@@ -6,7 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.roomcast.txt /app/requirements.roomcast.txt
-RUN pip install --no-cache-dir -r /app/requirements.roomcast.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev libopus0 \
+    && pip install --no-cache-dir -r /app/requirements.roomcast.txt \
+    && apt-get purge -y --auto-remove gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . /app
 

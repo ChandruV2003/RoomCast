@@ -33,6 +33,15 @@ class RoomCastStoreTests(unittest.TestCase):
         self.assertEqual(host["room_slug"], "meeting-hall")
         self.assertTrue(host["heartbeat_token"])
 
+    def test_store_connections_enable_wal_and_busy_timeout(self):
+        with self.store._connect() as connection:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertGreaterEqual(int(busy_timeout), 30000)
+        self.assertEqual(int(foreign_keys), 1)
+
     def test_replace_host_schedule_rewrites_rows(self):
         self.store.replace_host_schedule("hp-pavilion-14m-ba1xx", "SAT 18:00-20:00\nSUN 10:30-12:00")
         host = self.store.get_host("hp-pavilion-14m-ba1xx")
@@ -60,7 +69,7 @@ class RoomCastStoreTests(unittest.TestCase):
         host = self.store.get_host("hp-pavilion-14m-ba1xx")
         self.assertFalse(host["desired_active"])
 
-    def test_recent_schedule_end_waits_for_silence_warning_before_stopping(self):
+    def test_recent_schedule_end_waits_for_sustained_silence_before_stopping(self):
         tz = ZoneInfo("America/New_York")
         now = datetime.now(tz).replace(second=0, microsecond=0)
         start = (now - timedelta(minutes=35)).strftime("%H:%M")
@@ -89,6 +98,15 @@ class RoomCastStoreTests(unittest.TestCase):
             last_error="No program audio detected for 15 seconds. Check the room feed if the meeting should be active.",
             desired_active=False,
         )
+        host = self.store.get_host("hp-pavilion-14m-ba1xx")
+        self.assertTrue(host["desired_active"])
+
+        old_warning_at = (datetime.now(ZoneInfo("UTC")) - timedelta(minutes=6)).isoformat()
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE source_runtime SET last_error_changed_at = ? WHERE host_slug = ?",
+                (old_warning_at, "hp-pavilion-14m-ba1xx"),
+            )
         host = self.store.get_host("hp-pavilion-14m-ba1xx")
         self.assertFalse(host["desired_active"])
 
@@ -148,6 +166,27 @@ class RoomCastStoreTests(unittest.TestCase):
             user_agent="pytest",
         )
         self.store.close_orphaned_listener_sessions()
+        self.assertEqual(self.store.list_listener_sessions("study-room", active_only=True), [])
+
+    def test_close_orphaned_listener_sessions_clears_rows_with_live_meeting(self):
+        self.store.sync_meeting_state(
+            "study-room",
+            active=True,
+            host_slug="hp-envy-16-ad0xx",
+            trigger_mode="admin",
+            actor="test",
+        )
+        self.store.begin_listener_session(
+            "study-room",
+            channel="web",
+            participant_label="Web 127.0.0.1",
+            participant_key="session-2",
+            ip_address="127.0.0.1",
+            user_agent="pytest",
+        )
+
+        self.store.close_orphaned_listener_sessions()
+
         self.assertEqual(self.store.list_listener_sessions("study-room", active_only=True), [])
 
     def test_meeting_report_collects_listeners_and_incidents(self):

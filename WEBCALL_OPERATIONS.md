@@ -13,11 +13,11 @@
 
 - Open `https://ntcnas.myftp.org/webcall/admin`
 - Enter the admin password
-- Pick `Room A` or `Room B`
+- Pick `Main Sanctuary` or `Room B`
 - Press `Start Call` to bring that room live
 - Press `Stop Call` to take the room down
 - Use `Settings` for input order and schedule entries
-- Use `Turn Auto On` from the control panel only if a room was manually held on or off and you want it following the saved schedule again
+- Use `Auto` from the control panel only if a room was manually held on or off and you want it following the saved schedule again
 
 The admin panel is only a monitor/control surface. Closing the browser does not stop the service.
 
@@ -42,7 +42,7 @@ Settings always uses the current device list reported by each laptop agent, so t
 - Starts and stops ffmpeg publishing
 - Reports current device, ingest state, and last error
 - Warns after sustained silence
-- Allows schedule-driven auto-stop only after the scheduled end time and sustained silence
+- Allows schedule-driven auto-stop only after the scheduled end time and 5 minutes of sustained silence
 - Prevents duplicate agent instances for the same host
 
 Current limitation: the agent does not yet power-cycle USB devices or restart Focusrite drivers. It handles publish/retry logic, not hardware recovery.
@@ -54,6 +54,65 @@ Current limitation: the agent does not yet power-cycle USB devices or restart Fo
 - `Recent access` shows who connected recently and when
 - Web listeners are labeled from their IP address
 - Phone listeners are labeled from the calling number when the provider passes it through
+
+## Phone recording diagnostics
+
+RoomCast keeps two different phone-path captures:
+
+- `data/telnyx-debug-taps/` records the exact mono PCM frames RoomCast sends toward Telnyx before provider encoding.
+- Telnyx call recording records the provider-side phone call. Pull the latest completed recording with:
+
+```bash
+python3 scripts/fetch_telnyx_recording.py
+```
+
+The script loads `TELNYX_API_KEY` from `.env`, downloads the latest matching WAV into `data/telnyx-recordings/`, saves redacted metadata beside it, and prints basic channel metrics.
+
+To place an outside-in probe call through Twilio, set these variables in `.env` or the shell:
+
+```bash
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_FROM_NUMBER=+18449902638
+ROOMCAST_PHONE_NUMBER=+18628727904
+ROOMCAST_PHONE_PIN=7070
+```
+
+Then run:
+
+```bash
+python3 scripts/twilio_probe_call.py --wait --download-recording
+```
+
+The script uses Twilio's Calls REST API, sends the PIN as DTMF after answer, keeps the call silent for the configured probe duration, asks Twilio for a dual-channel recording, and downloads/analyzes the recording when available. If the Twilio account is still in trial mode, the destination number must be verified in Twilio before this test can complete.
+
+## Server watchdog and alerts
+
+The NAS runs a separate `roomcast-watchdog` container every 60 seconds. It checks:
+
+- `/healthz`
+- the public PIN path `/p/7070`
+- `/api/live/status`
+- the active HLS playlist and first audio segment when a meeting is live
+- source laptop heartbeats and ingest state
+
+If the server or public client path fails, the watchdog records an incident and asks Docker to restart the `roomcast` container. Restarts are rate-limited by `ROOMCAST_WATCHDOG_RESTART_COOLDOWN_SECONDS` so it does not loop endlessly.
+
+HTML email alerts are configured through environment variables:
+
+```bash
+ROOMCAST_ALERT_EMAIL_ENABLED=1
+ROOMCAST_ALERT_EMAIL_TO=alerts@example.com
+ROOMCAST_ALERT_EMAIL_FROM=roomcast@example.com
+ROOMCAST_ALERT_SMTP_HOST=smtp.example.com
+ROOMCAST_ALERT_SMTP_PORT=587
+ROOMCAST_ALERT_SMTP_USERNAME=roomcast@example.com
+ROOMCAST_ALERT_SMTP_PASSWORD=...
+ROOMCAST_ALERT_SMTP_STARTTLS=1
+ROOMCAST_ALERT_COOLDOWN_SECONDS=900
+```
+
+Alerts are deduplicated. A repeated failure sends at most one email per cooldown window, and a recovery email is sent when previously open issues clear.
 
 ## Setting up a new source laptop
 
@@ -67,10 +126,11 @@ Current limitation: the agent does not yet power-cycle USB devices or restart Fo
   -ServerUrl "https://ntcnas.myftp.org/webcall" `
   -HostSlug "<host-slug>" `
   -Token "<heartbeat-token>" `
-  -TaskName "WebCall Source Agent"
+  -TaskName "WebCall Source Agent" `
+  -PollIntervalSeconds 3
 ```
 
-5. The installer will stop stale RoomCast host processes, refresh the task, and start it immediately
+5. The installer will stop stale RoomCast host processes, refresh the task, add startup and logon triggers, and start it immediately
 6. Confirm the task is running
 7. Open the control panel and verify the new host shows `Agent online`
 8. Open `Settings` and confirm the known device list is populated for that host
@@ -90,7 +150,6 @@ Listeners can join from anywhere that can reach the public WebCall URL.
 
 ## Current phone status
 
-- The app-side phone flow exists
-- The server can issue a signed phone stream URL and track phone listener sessions
-- A real phone number is not live yet
-- To make PSTN calling public, a paid provider account and number still need to be provisioned
+- Telnyx is the live public phone provider for `+1 862 872 7904`.
+- Twilio can be used as an outside caller/debug probe, not as the production provider.
+- RoomCast keeps app-side debug taps plus provider recordings so phone quality can be checked from both sides of the handoff.

@@ -24,6 +24,7 @@ from schedule_engine import (
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_PIN = os.getenv("ROOMCAST_DEFAULT_PIN", "7070")
 SCHEDULE_HOLD_GRACE_MINUTES = 240
+POST_END_SILENCE_GRACE_SECONDS = int(os.getenv("ROOMCAST_POST_END_SILENCE_GRACE_SECONDS", "300"))
 
 ROOM_SEEDS = {
     "hp-pavilion-14m-ba1xx": {
@@ -34,8 +35,8 @@ ROOM_SEEDS = {
     },
     "hp-envy-16-ad0xx": {
         "slug": "study-room",
-        "label": "Bible Study Room",
-        "description": "Sunday and Wednesday audio room.",
+        "label": "Main Sanctuary",
+        "description": "Sunday service and Wednesday Bible study audio room.",
         "enabled": True,
     },
     "leonovo-laptop-mv23gfqd": {
@@ -113,6 +114,15 @@ def _is_silence_warning(message: str | None) -> bool:
     return (message or "").strip().startswith(SILENCE_WARNING_PREFIX)
 
 
+def _silence_warning_expired(runtime: dict | None) -> bool:
+    if not runtime or not _is_silence_warning(runtime.get("last_error")):
+        return False
+    started_at = _parse_iso8601_like(runtime.get("last_error_changed_at"))
+    if not started_at:
+        return False
+    return (datetime.now(timezone.utc) - started_at).total_seconds() >= POST_END_SILENCE_GRACE_SECONDS
+
+
 class RoomCastStore:
     """Persist rooms, source hosts, schedules, and source heartbeat state."""
 
@@ -125,8 +135,12 @@ class RoomCastStore:
         self._seed_defaults()
 
     def _connect(self):
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
         return connection
 
     def _init_db(self):
@@ -149,6 +163,7 @@ class RoomCastStore:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     manual_mode TEXT NOT NULL DEFAULT 'auto',
                     capture_mode TEXT NOT NULL DEFAULT 'auto',
+                    capture_sample_rate_hz INTEGER NOT NULL DEFAULT 48000,
                     notes TEXT NOT NULL DEFAULT '',
                     timezone TEXT NOT NULL DEFAULT 'America/New_York',
                     preferred_audio_pattern TEXT NOT NULL DEFAULT 'Scarlett',
@@ -175,6 +190,7 @@ class RoomCastStore:
                     device_list_json TEXT NOT NULL DEFAULT '[]',
                     is_ingesting INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
+                    last_error_changed_at TEXT NOT NULL DEFAULT '',
                     desired_active INTEGER NOT NULL DEFAULT 0,
                     stream_profile TEXT NOT NULL DEFAULT '',
                     stream_channels INTEGER NOT NULL DEFAULT 1,
@@ -263,6 +279,10 @@ class RoomCastStore:
                 connection.execute(
                     "ALTER TABLE hosts ADD COLUMN capture_mode TEXT NOT NULL DEFAULT 'auto'"
                 )
+            if "capture_sample_rate_hz" not in host_columns:
+                connection.execute(
+                    "ALTER TABLE hosts ADD COLUMN capture_sample_rate_hz INTEGER NOT NULL DEFAULT 48000"
+                )
             if "device_order_json" not in host_columns:
                 connection.execute(
                     "ALTER TABLE hosts ADD COLUMN device_order_json TEXT NOT NULL DEFAULT '[]'"
@@ -284,6 +304,10 @@ class RoomCastStore:
             if "sample_bits" not in runtime_columns:
                 connection.execute(
                     "ALTER TABLE source_runtime ADD COLUMN sample_bits INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_error_changed_at" not in runtime_columns:
+                connection.execute(
+                    "ALTER TABLE source_runtime ADD COLUMN last_error_changed_at TEXT NOT NULL DEFAULT ''"
                 )
 
             schedule_columns = {row["name"] for row in connection.execute("PRAGMA table_info(schedules)").fetchall()}
@@ -342,6 +366,7 @@ class RoomCastStore:
                         enabled,
                         manual_mode,
                         capture_mode,
+                        capture_sample_rate_hz,
                         notes,
                         timezone,
                         preferred_audio_pattern,
@@ -350,7 +375,7 @@ class RoomCastStore:
                         heartbeat_token,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         host["slug"],
@@ -359,6 +384,7 @@ class RoomCastStore:
                         1 if host["enabled"] else 0,
                         host["manual_mode"],
                         host.get("capture_mode", "auto"),
+                        max(8000, int(host.get("capture_sample_rate_hz") or 48000)),
                         host["notes"],
                         host["timezone"],
                         preferred_audio,
@@ -413,13 +439,14 @@ class RoomCastStore:
             connection.execute(
                 """
                 UPDATE hosts
-                SET label = ?, room_slug = ?, capture_mode = ?
+                SET label = ?, room_slug = ?, capture_mode = ?, capture_sample_rate_hz = ?
                 WHERE slug = ?
                 """,
                 (
                     host["label"],
                     room_seed["slug"],
                     host.get("capture_mode", "auto"),
+                    max(8000, int(host.get("capture_sample_rate_hz") or 48000)),
                     host["slug"],
                 ),
             )
@@ -577,7 +604,7 @@ class RoomCastStore:
     def _runtime_for_host(self, connection, slug: str):
         row = connection.execute(
             """
-            SELECT current_device, device_list_json, is_ingesting, last_error, desired_active, stream_profile, stream_channels, sample_rate_hz, sample_bits, last_seen_at
+            SELECT current_device, device_list_json, is_ingesting, last_error, last_error_changed_at, desired_active, stream_profile, stream_channels, sample_rate_hz, sample_bits, last_seen_at
             FROM source_runtime
             WHERE host_slug = ?
             """,
@@ -591,6 +618,7 @@ class RoomCastStore:
             "devices": _json_list(row["device_list_json"]),
             "is_ingesting": _bool_from_int(row["is_ingesting"]),
             "last_error": row["last_error"],
+            "last_error_changed_at": row["last_error_changed_at"],
             "desired_active": _bool_from_int(row["desired_active"]),
             "stream_profile": row["stream_profile"] or "",
             "stream_channels": int(row["stream_channels"] or 1),
@@ -620,7 +648,7 @@ class RoomCastStore:
                 schedule_hold_active
                 and runtime
                 and runtime["is_ingesting"]
-                and not _is_silence_warning(runtime["last_error"])
+                and not _silence_warning_expired(runtime)
             ):
                 desired_active = True
 
@@ -635,6 +663,7 @@ class RoomCastStore:
             "enabled": _bool_from_int(row["enabled"]),
             "manual_mode": row["manual_mode"],
             "capture_mode": row["capture_mode"],
+            "capture_sample_rate_hz": max(8000, int(row["capture_sample_rate_hz"] or 48000)),
             "notes": row["notes"],
             "timezone": row["timezone"],
             "preferred_audio_pattern": row["preferred_audio_pattern"],
@@ -713,6 +742,7 @@ class RoomCastStore:
                     hosts.enabled,
                     hosts.manual_mode,
                     hosts.capture_mode,
+                    hosts.capture_sample_rate_hz,
                     hosts.notes,
                     hosts.timezone,
                     hosts.preferred_audio_pattern,
@@ -740,6 +770,7 @@ class RoomCastStore:
                     hosts.enabled,
                     hosts.manual_mode,
                     hosts.capture_mode,
+                    hosts.capture_sample_rate_hz,
                     hosts.notes,
                     hosts.timezone,
                     hosts.preferred_audio_pattern,
@@ -766,6 +797,7 @@ class RoomCastStore:
         enabled: bool,
         manual_mode: str,
         capture_mode: str | None = None,
+        capture_sample_rate_hz: int | None = None,
         notes: str,
         device_order=None,
     ):
@@ -775,7 +807,7 @@ class RoomCastStore:
         with self._connect() as connection:
             existing = connection.execute(
                 """
-                SELECT preferred_audio_pattern, fallback_audio_pattern, device_order_json, capture_mode
+                SELECT preferred_audio_pattern, fallback_audio_pattern, device_order_json, capture_mode, capture_sample_rate_hz
                 FROM hosts
                 WHERE slug = ?
                 """,
@@ -786,6 +818,14 @@ class RoomCastStore:
 
             next_device_order = _json_list(existing["device_order_json"])
             next_capture_mode = (capture_mode or existing["capture_mode"] or "auto").strip() or "auto"
+            next_capture_sample_rate_hz = max(
+                8000,
+                int(
+                    capture_sample_rate_hz
+                    if capture_sample_rate_hz is not None
+                    else (existing["capture_sample_rate_hz"] or 48000)
+                ),
+            )
             if device_order is not None:
                 next_device_order = []
                 for item in device_order:
@@ -796,13 +836,14 @@ class RoomCastStore:
             cursor = connection.execute(
                 """
                 UPDATE hosts
-                SET enabled = ?, manual_mode = ?, capture_mode = ?, notes = ?, preferred_audio_pattern = ?, fallback_audio_pattern = ?, device_order_json = ?, updated_at = ?
+                SET enabled = ?, manual_mode = ?, capture_mode = ?, capture_sample_rate_hz = ?, notes = ?, preferred_audio_pattern = ?, fallback_audio_pattern = ?, device_order_json = ?, updated_at = ?
                 WHERE slug = ?
                 """,
                 (
                     1 if enabled else 0,
                     manual_mode,
                     next_capture_mode,
+                    next_capture_sample_rate_hz,
                     (notes or "").strip(),
                     existing["preferred_audio_pattern"],
                     existing["fallback_audio_pattern"],
@@ -951,16 +992,14 @@ class RoomCastStore:
     def close_orphaned_listener_sessions(self):
         timestamp = _utc_now()
         with self._connect() as connection:
+            # Listener sockets are process-local. If the server process starts
+            # with open listener rows, those rows belong to a previous process
+            # and cannot still represent live clients.
             connection.execute(
                 """
                 UPDATE listener_sessions
                 SET left_at = ?
                 WHERE left_at IS NULL
-                  AND room_slug NOT IN (
-                      SELECT room_slug
-                      FROM meeting_sessions
-                      WHERE ended_at IS NULL
-                  )
                 """,
                 (timestamp,),
             )
@@ -1030,6 +1069,7 @@ class RoomCastStore:
                        source_runtime.device_list_json,
                        source_runtime.is_ingesting,
                        source_runtime.last_error,
+                       source_runtime.last_error_changed_at,
                        source_runtime.stream_profile,
                        source_runtime.stream_channels,
                        source_runtime.sample_rate_hz,
@@ -1042,6 +1082,13 @@ class RoomCastStore:
                 (host_slug,),
             ).fetchone()
 
+            normalized_error = (last_error or "").strip()
+            previous_error = (prior["last_error"] or "") if prior else ""
+            previous_error_changed_at = (prior["last_error_changed_at"] or "") if prior else ""
+            error_changed_at = previous_error_changed_at if normalized_error == previous_error and previous_error_changed_at else timestamp
+            if not normalized_error:
+                error_changed_at = ""
+
             connection.execute(
                 """
                 INSERT INTO source_runtime (
@@ -1050,6 +1097,7 @@ class RoomCastStore:
                     device_list_json,
                     is_ingesting,
                     last_error,
+                    last_error_changed_at,
                     desired_active,
                     stream_profile,
                     stream_channels,
@@ -1057,12 +1105,13 @@ class RoomCastStore:
                     sample_bits,
                     last_seen_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host_slug) DO UPDATE SET
                     current_device = excluded.current_device,
                     device_list_json = excluded.device_list_json,
                     is_ingesting = excluded.is_ingesting,
                     last_error = excluded.last_error,
+                    last_error_changed_at = excluded.last_error_changed_at,
                     desired_active = excluded.desired_active,
                     stream_profile = excluded.stream_profile,
                     stream_channels = excluded.stream_channels,
@@ -1076,6 +1125,7 @@ class RoomCastStore:
                     json.dumps(_dedupe_list(devices)),
                     1 if is_ingesting else 0,
                     (last_error or "").strip(),
+                    error_changed_at,
                     1 if desired_active else 0,
                     (stream_profile or "").strip(),
                     max(1, int(stream_channels or 1)),
@@ -1160,8 +1210,6 @@ class RoomCastStore:
                     occurred_at=timestamp,
                 )
 
-            previous_error = (prior["last_error"] or "") if prior else ""
-            normalized_error = (last_error or "").strip()
             if prior and normalized_error and normalized_error != previous_error:
                 connection.execute(
                     """

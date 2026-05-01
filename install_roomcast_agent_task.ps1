@@ -19,8 +19,12 @@ param(
 
 $resolvedRepo = (Resolve-Path $RepoPath).Path
 $agentScript = Join-Path $resolvedRepo "roomcast_agent.py"
+$ensureScript = Join-Path $resolvedRepo "ensure_roomcast_agent.ps1"
 if (-not (Test-Path $agentScript)) {
     throw "roomcast_agent.py was not found in $resolvedRepo"
+}
+if (-not (Test-Path $ensureScript)) {
+    throw "ensure_roomcast_agent.ps1 was not found in $resolvedRepo"
 }
 
 $resolvedPythonSelector = $PythonSelector
@@ -51,28 +55,28 @@ if (-not (Test-Path $resolvedPythonExecutable)) {
     throw "Resolved Python executable was not found: $resolvedPythonExecutable"
 }
 
-$agentArgs = @(
-    "'$agentScript'"
-    "--server-url '$ServerUrl'"
-    "--host-slug '$HostSlug'"
-    "--token '$Token'"
-    "--poll-interval '$PollIntervalSeconds'"
+$ensureArgs = @(
+    "& '$ensureScript'"
+    "-ServerUrl '$ServerUrl'"
+    "-HostSlug '$HostSlug'"
+    "-Token '$Token'"
+    "-RepoPath '$resolvedRepo'"
+    "-PythonExecutable '$resolvedPythonExecutable'"
+    "-PollIntervalSeconds $PollIntervalSeconds"
 ) -join " "
+
+$encodedEnsureCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ensureArgs))
+$powershellTaskArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedEnsureCommand"
 
 $runtimeDir = Join-Path $resolvedRepo "runtime"
 $lockPath = Join-Path $runtimeDir "$HostSlug-roomcast-agent.lock"
 
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NoProfile -WindowStyle Hidden -Command `$ErrorActionPreference = 'Stop'; Set-Location '$resolvedRepo'; & '$resolvedPythonExecutable' $agentArgs"
+    -Argument $powershellTaskArguments
 
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
-$guardianTrigger = New-ScheduledTaskTrigger `
-    -Once `
-    -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 1) `
-    -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -85,6 +89,19 @@ $principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
     -LogonType Interactive `
     -RunLevel Highest
+
+$guardianTaskName = "$TaskName Guardian"
+$guardianAction = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument $powershellTaskArguments
+$guardianSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -WakeToRun `
+    -MultipleInstances IgnoreNew
 
 if ($EnforcePowerProfile) {
     $powerCommands = @(
@@ -116,6 +133,10 @@ try {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
 } catch {
 }
+try {
+    Stop-ScheduledTask -TaskName $guardianTaskName -ErrorAction SilentlyContinue | Out-Null
+} catch {
+}
 
 Get-CimInstance Win32_Process |
     Where-Object { $_.CommandLine -match "roomcast_agent.py" } |
@@ -142,12 +163,74 @@ if (Test-Path $lockPath) {
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger @($logonTrigger, $startupTrigger, $guardianTrigger) `
+    -Trigger @($logonTrigger, $startupTrigger) `
     -Settings $settings `
     -Principal $principal `
     -Description "WebCall source agent for $HostSlug" `
     -Force | Out-Null
 
-Start-ScheduledTask -TaskName $TaskName
+$guardianStartBoundary = [DateTime]::Now.AddMinutes(1).ToString("s")
+$guardianXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>WebCall guardian for $HostSlug</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>$guardianStartBoundary</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <Duration>P1D</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$env:USERNAME</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>true</WakeToRun>
+    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>$powershellTaskArguments</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
 
-Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State, Author
+$guardianXmlPath = Join-Path $env:TEMP "$($HostSlug)-roomcast-guardian.xml"
+$guardianXml | Out-File -FilePath $guardianXmlPath -Encoding Unicode -Force
+Register-ScheduledTask -TaskName $guardianTaskName -Xml (Get-Content -Raw $guardianXmlPath) -Force | Out-Null
+Remove-Item $guardianXmlPath -Force -ErrorAction SilentlyContinue
+
+Start-ScheduledTask -TaskName $TaskName
+Start-ScheduledTask -TaskName $guardianTaskName
+
+Get-ScheduledTask -TaskName $TaskName, $guardianTaskName | Select-Object TaskName, State, Author

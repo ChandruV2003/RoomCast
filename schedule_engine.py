@@ -96,6 +96,47 @@ def is_schedule_active(rows, when: datetime | None = None, timezone: str = "Amer
     return False
 
 
+def is_schedule_hold_active(
+    rows,
+    when: datetime | None = None,
+    timezone: str = "America/New_York",
+    grace_minutes: int = 240,
+) -> bool:
+    """Return True when we are shortly after a scheduled end time."""
+
+    tz = ZoneInfo(timezone)
+    current = when.astimezone(tz) if when else datetime.now(tz)
+    window_start = current - timedelta(minutes=grace_minutes)
+    today = current.date()
+
+    for row in normalize_schedule_rows(rows):
+        if not row["enabled"]:
+            continue
+
+        day_index = DAY_INDEX[row["day"]]
+        start = _minutes_since_midnight(row["start"])
+        end = _minutes_since_midnight(row["end"])
+
+        for offset in range(-8, 1):
+            candidate_date = today + timedelta(days=offset)
+            if candidate_date.weekday() != day_index:
+                continue
+
+            end_date = candidate_date if start <= end else candidate_date + timedelta(days=1)
+            end_at = datetime(
+                end_date.year,
+                end_date.month,
+                end_date.day,
+                end // 60,
+                end % 60,
+                tzinfo=tz,
+            )
+            if window_start <= end_at <= current:
+                return True
+
+    return False
+
+
 def next_schedule_change(rows, when: datetime | None = None, timezone: str = "America/New_York"):
     """Return the next datetime where the schedule flips state, or None."""
 

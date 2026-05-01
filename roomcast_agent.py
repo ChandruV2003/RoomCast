@@ -45,12 +45,17 @@ class RoomCastAgent:
         silence_timeout_seconds: int = 45,
         silence_noise_threshold: str = "-45dB",
         restart_cooldown_seconds: int = 20,
+        microphone_array_gain_db: float = 14.0,
+        microphone_array_highpass_hz: int = 120,
+        capture_sample_rate_hz: int = 48000,
     ):
         self.server_url = server_url.rstrip("/")
         self.host_slug = host_slug
         self.token = token
         self.repo_root = Path(__file__).resolve().parent
         self.ffmpeg_path = ffmpeg_path or self._discover_ffmpeg()
+        self.os_name = os.name
+        self.platform_name = sys.platform
         self.poll_interval = poll_interval
         self.device_order = [str(item).strip() for item in (device_order or []) if str(item).strip()]
         self.preferred_audio_pattern = preferred_audio_pattern
@@ -59,6 +64,9 @@ class RoomCastAgent:
         self.silence_timeout_seconds = silence_timeout_seconds
         self.silence_noise_threshold = silence_noise_threshold
         self.restart_cooldown_seconds = restart_cooldown_seconds
+        self.microphone_array_gain_db = microphone_array_gain_db
+        self.microphone_array_highpass_hz = microphone_array_highpass_hz
+        self.capture_sample_rate_hz = self._normalize_sample_rate(capture_sample_rate_hz)
         runtime_dir = self.repo_root / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_dir = runtime_dir
@@ -73,6 +81,7 @@ class RoomCastAgent:
         self.current_device = "test-tone" if test_tone else ""
         self.last_error = ""
         self.cached_devices = []
+        self.cached_device_inputs: dict[str, str] = {}
         self.desired_active = False
         self.silence_triggered = False
         self.restart_not_before = 0.0
@@ -80,6 +89,13 @@ class RoomCastAgent:
         self.capture_mode = "auto"
         self._event_throttle: dict[tuple[str, str], float] = {}
         self._last_desired_active: bool | None = None
+
+    @staticmethod
+    def _normalize_sample_rate(value: int | None) -> int:
+        try:
+            return max(8000, int(value or 48000))
+        except (TypeError, ValueError):
+            return 48000
 
     def _silence_warning_message(self) -> str:
         return (
@@ -97,6 +113,12 @@ class RoomCastAgent:
             if candidate and Path(candidate).exists():
                 return str(candidate)
         raise FileNotFoundError("ffmpeg was not found. Install it or pass --ffmpeg-path.")
+
+    def _is_windows(self) -> bool:
+        return self.os_name == "nt"
+
+    def _is_macos(self) -> bool:
+        return self.platform_name == "darwin"
 
     def _process_is_running(self) -> bool:
         return bool(self.process and self.process.poll() is None)
@@ -136,34 +158,77 @@ class RoomCastAgent:
     def list_audio_devices(self):
         if self.test_tone:
             return ["test-tone"]
-        if os.name != "nt":
+        if self._is_windows():
+            command = [
+                self.ffmpeg_path,
+                "-hide_banner",
+                "-list_devices",
+                "true",
+                "-f",
+                "dshow",
+                "-i",
+                "dummy",
+            ]
+        elif self._is_macos():
+            command = [
+                self.ffmpeg_path,
+                "-hide_banner",
+                "-f",
+                "avfoundation",
+                "-list_devices",
+                "true",
+                "-i",
+                "",
+            ]
+        else:
+            self.cached_devices = []
+            self.cached_device_inputs = {}
             return []
-
-        command = [
-            self.ffmpeg_path,
-            "-hide_banner",
-            "-list_devices",
-            "true",
-            "-f",
-            "dshow",
-            "-i",
-            "dummy",
-        ]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         output = "\n".join(filter(None, [completed.stdout, completed.stderr]))
         devices = []
-        for line in output.splitlines():
-            if "(audio)" not in line:
-                continue
-            match = re.search(r'"([^"]+)"', line)
-            if match:
-                devices.append(match.group(1))
+        device_inputs: dict[str, str] = {}
+        if self._is_windows():
+            for line in output.splitlines():
+                if "(audio)" not in line:
+                    continue
+                match = re.search(r'"([^"]+)"', line)
+                if match:
+                    device_name = match.group(1)
+                    devices.append(device_name)
+                    device_inputs[device_name] = f"audio={device_name}"
+        elif self._is_macos():
+            in_audio_section = False
+            for line in output.splitlines():
+                if "AVFoundation audio devices:" in line:
+                    in_audio_section = True
+                    continue
+                if "AVFoundation video devices:" in line:
+                    in_audio_section = False
+                    continue
+                if not in_audio_section:
+                    continue
+                match = re.search(r"\[(\d+)\]\s+(.*)$", line)
+                if match:
+                    device_index = match.group(1)
+                    device_name = match.group(2).strip()
+                    if device_name:
+                        devices.append(device_name)
+                        device_inputs[device_name] = f":{device_index}"
         deduped = []
         for device in devices:
             if device not in deduped:
                 deduped.append(device)
         self.cached_devices = deduped
+        self.cached_device_inputs = {device: device_inputs.get(device, device) for device in deduped}
         return deduped
+
+    def _resolve_input_spec(self, device_name: str) -> str:
+        if self.test_tone:
+            return "test-tone"
+        if self._is_macos():
+            return self.cached_device_inputs.get(device_name, f":{device_name}")
+        return self.cached_device_inputs.get(device_name, f"audio={device_name}")
 
     @staticmethod
     def _match_device(devices, pattern: str | None):
@@ -206,59 +271,73 @@ class RoomCastAgent:
     def _audio_profile(self, device_name: str | None, stream_profile: str = "mp3", capture_mode: str | None = None):
         name = (device_name or "").casefold()
         resolved_mode = self._resolve_capture_mode(device_name, capture_mode)
+        microphone_array_filters: list[str] = []
+        if "microphone array" in name:
+            if self.microphone_array_highpass_hz > 0:
+                microphone_array_filters.append(f"highpass=f={self.microphone_array_highpass_hz}")
+            if abs(self.microphone_array_gain_db) > 0.01:
+                microphone_array_filters.append(f"volume={self.microphone_array_gain_db}dB")
+            microphone_array_filters.append("alimiter=limit=0.92")
         if "stereo mix" in name:
             profile = {
                 "channels": 2,
                 "bitrate": "192k",
-                "filter_prefix": [],
+                "filter_prefix": microphone_array_filters[:],
             }
             if resolved_mode == "mono-sum":
                 profile["channels"] = 1
                 profile["bitrate"] = "128k" if stream_profile == "mp3" else ""
-                profile["filter_prefix"] = ["pan=mono|c0=.5*c0+.5*c1"]
+                profile["filter_prefix"] = microphone_array_filters[:] + ["pan=mono|c0=.5*c0+.5*c1"]
             elif resolved_mode == "mono-left":
                 profile["channels"] = 1
                 profile["bitrate"] = "128k" if stream_profile == "mp3" else ""
-                profile["filter_prefix"] = ["pan=mono|c0=c0"]
+                profile["filter_prefix"] = microphone_array_filters[:] + ["pan=mono|c0=c0"]
             elif resolved_mode == "mono-right":
                 profile["channels"] = 1
                 profile["bitrate"] = "128k" if stream_profile == "mp3" else ""
-                profile["filter_prefix"] = ["pan=mono|c0=c1"]
+                profile["filter_prefix"] = microphone_array_filters[:] + ["pan=mono|c0=c1"]
             return profile
 
         if resolved_mode == "stereo":
             return {
                 "channels": 2,
                 "bitrate": "192k" if stream_profile == "mp3" else "",
-                "filter_prefix": [],
+                "filter_prefix": microphone_array_filters[:],
             }
 
         if resolved_mode == "mono-left":
             return {
                 "channels": 1,
                 "bitrate": "128k" if stream_profile == "mp3" else "",
-                "filter_prefix": ["pan=mono|c0=c0"],
+                "filter_prefix": microphone_array_filters[:] + ["pan=mono|c0=c0"],
             }
 
         if resolved_mode == "mono-right":
             return {
                 "channels": 1,
                 "bitrate": "128k" if stream_profile == "mp3" else "",
-                "filter_prefix": ["pan=mono|c0=c1"],
+                "filter_prefix": microphone_array_filters[:] + ["pan=mono|c0=c1"],
             }
 
         if resolved_mode == "mono-sum":
             return {
                 "channels": 1,
                 "bitrate": "128k" if stream_profile == "mp3" else "",
-                "filter_prefix": ["pan=mono|c0=.5*c0+.5*c1"],
+                "filter_prefix": microphone_array_filters[:] + ["pan=mono|c0=.5*c0+.5*c1"],
             }
 
         return {
             "channels": 1,
             "bitrate": "128k",
-            "filter_prefix": [],
+            "filter_prefix": microphone_array_filters[:],
         }
+
+    @staticmethod
+    def _input_channels_for_profile(profile: dict) -> int:
+        filters = " ".join(profile.get("filter_prefix") or [])
+        if any(marker in filters for marker in ("c1", ".5*c0+.5*c1")):
+            return 2
+        return max(1, int(profile.get("channels") or 1))
 
     def choose_device(self, server_device_order=None, server_preferred: str | None = None, server_fallback: str | None = None):
         if self.test_tone:
@@ -290,7 +369,7 @@ class RoomCastAgent:
             "last_error": self.last_error,
             "stream_profile": self.stream_profile,
             "stream_channels": stream_preview["channels"],
-            "sample_rate_hz": 48000,
+            "sample_rate_hz": self.capture_sample_rate_hz,
             "sample_bits": 24 if self.stream_profile == "wav_pcm24" else 0,
             "capture_mode": self._resolve_capture_mode(self.current_device or None, self.capture_mode),
         }
@@ -343,6 +422,8 @@ class RoomCastAgent:
     def _build_ffmpeg_command(self, ingest_url: str, device_name: str, stream_profile: str | None = None):
         active_stream_profile = (stream_profile or self.stream_profile or "mp3").strip().lower() or "mp3"
         profile = self._audio_profile(device_name, active_stream_profile, self.capture_mode)
+        sample_rate_hz = self._normalize_sample_rate(self.capture_sample_rate_hz)
+        input_channels = self._input_channels_for_profile(profile)
         command = [
             self.ffmpeg_path,
             "-hide_banner",
@@ -361,31 +442,49 @@ class RoomCastAgent:
                     "-f",
                     "lavfi",
                     "-i",
-                    "sine=frequency=880:sample_rate=48000",
+                    f"sine=frequency=880:sample_rate={sample_rate_hz}",
                 ]
             )
         else:
             filter_chain = list(profile["filter_prefix"])
             filter_chain.append(f"silencedetect=noise={self.silence_noise_threshold}:d={self.silence_timeout_seconds}")
-            command.extend(
-                [
-                    "-f",
-                    "dshow",
-                    "-audio_buffer_size",
-                    "20",
-                    "-i",
-                    f"audio={device_name}",
-                    "-af",
-                    ",".join(filter_chain),
-                ]
-            )
+            if self._is_windows():
+                command.extend(
+                    [
+                        "-f",
+                        "dshow",
+                        "-audio_buffer_size",
+                        "20",
+                        "-sample_rate",
+                        str(sample_rate_hz),
+                        "-channels",
+                        str(input_channels),
+                        "-i",
+                        self._resolve_input_spec(device_name),
+                        "-af",
+                        ",".join(filter_chain),
+                    ]
+                )
+            elif self._is_macos():
+                command.extend(
+                    [
+                        "-f",
+                        "avfoundation",
+                        "-i",
+                        self._resolve_input_spec(device_name),
+                        "-af",
+                        ",".join(filter_chain),
+                    ]
+                )
+            else:
+                raise RuntimeError(f"Unsupported capture platform: {self.platform_name}")
 
         command.extend(
             [
                 "-ac",
                 str(profile["channels"]),
                 "-ar",
-                "48000",
+                str(sample_rate_hz),
             ]
         )
         if active_stream_profile == "wav_pcm24":
@@ -459,6 +558,7 @@ class RoomCastAgent:
                 "device_name": device_name,
                 "stream_profile": active_stream_profile,
                 "capture_mode": self.capture_mode,
+                "capture_sample_rate_hz": self.capture_sample_rate_hz,
             },
         )
         self.process = subprocess.Popen(
@@ -556,6 +656,7 @@ class RoomCastAgent:
                     self._last_desired_active = self.desired_active
                 self.stream_profile = (reply.get("stream_profile") or self.stream_profile or "mp3").strip().lower() or "mp3"
                 self.capture_mode = (reply.get("capture_mode") or self.capture_mode or "auto").strip().lower() or "auto"
+                self.capture_sample_rate_hz = self._normalize_sample_rate(reply.get("capture_sample_rate_hz"))
                 if self.last_error != self._silence_warning_message():
                     self.last_error = ""
 
@@ -650,6 +751,9 @@ def main():
     parser.add_argument("--silence-timeout-seconds", type=int, default=15, help="Warn after this many silent seconds")
     parser.add_argument("--silence-noise-threshold", default="-45dB", help="ffmpeg silencedetect noise threshold")
     parser.add_argument("--restart-cooldown-seconds", type=int, default=20, help="Seconds to wait before retrying after an auto-stop")
+    parser.add_argument("--microphone-array-gain-db", type=float, default=14.0, help="Gain applied when the source falls back to a laptop microphone array")
+    parser.add_argument("--microphone-array-highpass-hz", type=int, default=120, help="High-pass filter frequency for laptop microphone array fallback")
+    parser.add_argument("--capture-sample-rate-hz", type=int, default=48000, help="Preferred capture sample rate in Hz")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -674,6 +778,9 @@ def main():
         silence_timeout_seconds=args.silence_timeout_seconds,
         silence_noise_threshold=args.silence_noise_threshold,
         restart_cooldown_seconds=args.restart_cooldown_seconds,
+        microphone_array_gain_db=args.microphone_array_gain_db,
+        microphone_array_highpass_hz=args.microphone_array_highpass_hz,
+        capture_sample_rate_hz=args.capture_sample_rate_hz,
     )
 
     if args.list_devices:

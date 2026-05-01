@@ -82,10 +82,11 @@ Important environment values:
   -ServerUrl "https://ntcnas.myftp.org/webcall" `
   -HostSlug "<host-slug>" `
   -Token "<heartbeat-token>" `
-  -TaskName "WebCall Source Agent"
+  -TaskName "WebCall Source Agent" `
+  -PollIntervalSeconds 3
 ```
 
-5. The installer will register the task, clear stale RoomCast agent processes for that host, and start the task immediately.
+5. The installer will register startup and logon triggers, clear stale RoomCast agent processes for that host, and start the task immediately.
 6. Sign into Windows and confirm the scheduled task is running.
 6. Open the admin panel and check that:
    - the host shows `Agent online`
@@ -97,11 +98,20 @@ Important environment values:
 - Shared listener PIN: `7070`
 - Public name: `NTC Newark WebCall`
 - Room B default schedule:
-  - Saturday `18:00-21:00` enabled
-  - Weeknights `19:00-21:00` saved disabled
+  - Thursday and Friday `18:50-21:00` enabled
+  - Saturday `17:50-20:30` enabled
+  - Morning templates `10:20-13:00` saved disabled for every day
+  - Evening templates `18:50-21:00` saved disabled for Monday through Wednesday
+  - No Sunday evening template
+- Room A default schedule:
+  - Wednesday `18:50-21:00` enabled
+  - Sunday `10:20-14:00` enabled
+  - No other saved rows
+- Silence handling:
+  - The admin panel warns after 15 seconds without program audio.
+  - After a scheduled end time, auto-stop waits for 5 minutes of sustained silence before ending the room.
 
 ## Current limitations
 
-- PSTN dial-in is not provisioned yet. The app-side telephony hooks exist, but no paid number is active.
 - The agent handles publish/retry logic, not USB driver restarts.
 - The installer auto-detects `py -3.13`, `-3.12`, `-3.11`, then `-3` in that order unless you pass `-PythonSelector`.

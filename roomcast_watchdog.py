@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
+import socket
+import smtplib
+import tempfile
+import time
+from email.message import EmailMessage
+from http.cookiejar import CookieJar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urljoin
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from roomcast_store import RoomCastStore
 
@@ -29,6 +40,674 @@ class WatchdogIssue:
     message: str
 
 
+@dataclass
+class ServerHealthResult:
+    ok: bool
+    status_code: int | None
+    message: str
+
+
+@dataclass
+class EndpointProbeResult:
+    ok: bool
+    name: str
+    url: str
+    status_code: int | None
+    elapsed_ms: int
+    message: str
+    details: dict
+
+
+@dataclass
+class EmailAlertConfig:
+    enabled: bool
+    smtp_host: str
+    smtp_port: int
+    smtp_username: str
+    smtp_password: str
+    smtp_starttls: bool
+    mail_from: str
+    mail_to: list[str]
+    subject_prefix: str
+    cooldown_seconds: float
+    send_resolved: bool
+
+
+def _load_state(path: str):
+    state_path = Path(path)
+    if not state_path.exists():
+        return {}
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_state(path: str, state):
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=state_path.parent,
+            prefix=f".{state_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(json.dumps(state, sort_keys=True, indent=2))
+        temp_path.replace(state_path)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _split_csv(value: str | None) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def check_server_health(health_url: str, *, timeout_seconds: float = 3.0):
+    try:
+        with urlopen(health_url, timeout=max(0.5, float(timeout_seconds))) as response:
+            status_code = getattr(response, "status", None) or response.getcode()
+            body = response.read()
+    except URLError as exc:
+        return ServerHealthResult(ok=False, status_code=None, message=str(exc.reason or exc))
+    except Exception as exc:
+        return ServerHealthResult(ok=False, status_code=None, message=str(exc))
+
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        payload = {}
+
+    ok = 200 <= int(status_code or 0) < 300 and bool(payload.get("ok"))
+    message = "healthy" if ok else (payload.get("error") or f"unexpected health response {status_code}")
+    return ServerHealthResult(ok=ok, status_code=int(status_code or 0), message=str(message))
+
+
+def _request(opener, url: str, *, timeout_seconds: float, accept: str = "application/json", headers: dict | None = None):
+    request_headers = {
+        "Accept": accept,
+        "User-Agent": "RoomCastWatchdog/1.0",
+    }
+    request_headers.update(headers or {})
+    request = Request(
+        url,
+        headers=request_headers,
+    )
+    start = time.monotonic()
+    try:
+        response = opener.open(request, timeout=max(0.5, float(timeout_seconds)))
+        body = response.read()
+        status_code = getattr(response, "status", None) or response.getcode()
+        return int(status_code or 0), body, int((time.monotonic() - start) * 1000), str(response.geturl())
+    except HTTPError as exc:
+        body = exc.read()
+        return int(exc.code), body, int((time.monotonic() - start) * 1000), str(exc.geturl())
+
+
+def _cookie_header(jar: CookieJar) -> str:
+    return "; ".join(f"{cookie.name}={cookie.value}" for cookie in jar)
+
+
+def _probe_failure(name: str, url: str, status_code: int | None, elapsed_ms: int, message: str, details: dict | None = None):
+    return EndpointProbeResult(
+        ok=False,
+        name=name,
+        url=url,
+        status_code=status_code,
+        elapsed_ms=elapsed_ms,
+        message=message,
+        details=details or {},
+    )
+
+
+def check_client_routes(
+    base_url: str,
+    *,
+    public_pin: str,
+    timeout_seconds: float = 4.0,
+    hls_timeout_seconds: float = 12.0,
+):
+    """Exercise the real public client path that users hit.
+
+    /healthz can be fine while the public/HLS route is wedged, so this keeps
+    the failure mode that just happened from hiding behind a green health check.
+    """
+
+    base = base_url.rstrip("/") + "/"
+    jar = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(jar))
+    results: list[EndpointProbeResult] = []
+    auth_headers: dict[str, str] = {}
+
+    def add_ok(name: str, url: str, status_code: int, elapsed_ms: int, message: str, details: dict | None = None):
+        results.append(EndpointProbeResult(True, name, url, status_code, elapsed_ms, message, details or {}))
+
+    try:
+        join_url = urljoin(base, f"p/{quote(str(public_pin), safe='')}")
+        status_code, body, elapsed_ms, final_url = _request(
+            opener,
+            join_url,
+            timeout_seconds=timeout_seconds,
+            accept="text/html,application/xhtml+xml",
+        )
+        if status_code != 200:
+            results.append(
+                _probe_failure(
+                    "public-page",
+                    join_url,
+                    status_code,
+                    elapsed_ms,
+                    f"public page returned HTTP {status_code}",
+                    {"final_url": final_url},
+                )
+            )
+            return results
+
+        html_text = body.decode("utf-8", errors="replace")
+        if "/listen/live.m3u8" not in html_text and "/listen/live.wav" not in html_text:
+            # The production session cookie is Secure. Internal watchdog probes
+            # use plain HTTP to the Docker service name, so CookieJar stores the
+            # cookie but refuses to resend it. Send it explicitly for this
+            # internal-only probe so we still exercise the real listener page.
+            manual_cookie = _cookie_header(jar)
+            if manual_cookie:
+                live_url = urljoin(base, "live")
+                status_code, body, elapsed_ms, final_url = _request(
+                    opener,
+                    live_url,
+                    timeout_seconds=timeout_seconds,
+                    accept="text/html,application/xhtml+xml",
+                    headers={"Cookie": manual_cookie},
+                )
+                html_text = body.decode("utf-8", errors="replace")
+                auth_headers = {"Cookie": manual_cookie}
+                if status_code == 200 and ("/listen/live.m3u8" in html_text or "/listen/live.wav" in html_text):
+                    add_ok("public-page", live_url, status_code, elapsed_ms, "public page loaded", {"final_url": final_url})
+                else:
+                    results.append(
+                        _probe_failure(
+                            "public-page",
+                            live_url,
+                            status_code,
+                            elapsed_ms,
+                            "public page loaded but did not include a stream URL",
+                            {"final_url": final_url},
+                        )
+                    )
+                    return results
+            else:
+                results.append(
+                    _probe_failure(
+                        "public-page",
+                        join_url,
+                        status_code,
+                        elapsed_ms,
+                        "public page loaded but did not include a stream URL",
+                        {"final_url": final_url},
+                    )
+                )
+                return results
+        else:
+            add_ok("public-page", join_url, status_code, elapsed_ms, "public page loaded", {"final_url": final_url})
+
+        if not auth_headers:
+            manual_cookie = _cookie_header(jar)
+            if manual_cookie:
+                auth_headers = {"Cookie": manual_cookie}
+
+        status_url = urljoin(base, "api/live/status")
+        status_code, body, elapsed_ms, final_url = _request(
+            opener,
+            status_url,
+            timeout_seconds=timeout_seconds,
+            accept="application/json",
+            headers=auth_headers,
+        )
+        if status_code != 200:
+            results.append(
+                _probe_failure(
+                    "live-status",
+                    status_url,
+                    status_code,
+                    elapsed_ms,
+                    f"live status returned HTTP {status_code}",
+                )
+            )
+            return results
+        try:
+            live_status = json.loads(body.decode("utf-8") or "{}")
+        except Exception as exc:
+            results.append(_probe_failure("live-status", status_url, status_code, elapsed_ms, f"invalid live status JSON: {exc}"))
+            return results
+        add_ok(
+            "live-status",
+            status_url,
+            status_code,
+            elapsed_ms,
+            "live status loaded",
+            {
+                "broadcasting": bool(live_status.get("broadcasting")),
+                "is_ingesting": bool(live_status.get("is_ingesting")),
+                "desired_active": bool(live_status.get("desired_active")),
+                "signal_level_percent": live_status.get("signal_level_percent"),
+            },
+        )
+
+        active = bool(
+            live_status.get("broadcasting")
+            or live_status.get("is_ingesting")
+            or live_status.get("desired_active")
+        )
+        if not active:
+            return results
+
+        hls_match = None
+        marker = "/listen/live.m3u8?client="
+        marker_index = html_text.find(marker)
+        if marker_index >= 0:
+            end_index = marker_index
+            while end_index < len(html_text) and html_text[end_index] not in {'"', "'", "<", "&"}:
+                end_index += 1
+            hls_match = html_text[marker_index:end_index]
+        if not hls_match:
+            results.append(
+                _probe_failure(
+                    "hls-playlist",
+                    urljoin(base, "listen/live.m3u8"),
+                    None,
+                    0,
+                    "active public page did not expose an HLS playlist URL",
+                )
+            )
+            return results
+
+        playlist_url = urljoin(base, hls_match)
+        status_code, body, elapsed_ms, final_url = _request(
+            opener,
+            playlist_url,
+            timeout_seconds=hls_timeout_seconds,
+            accept="application/vnd.apple.mpegurl,*/*",
+            headers=auth_headers,
+        )
+        if status_code != 200:
+            results.append(
+                _probe_failure(
+                    "hls-playlist",
+                    playlist_url,
+                    status_code,
+                    elapsed_ms,
+                    f"HLS playlist returned HTTP {status_code} while a meeting is active",
+                )
+            )
+            return results
+
+        playlist_text = body.decode("utf-8", errors="replace")
+        segment_path = next(
+            (line.strip() for line in playlist_text.splitlines() if line.strip() and not line.startswith("#")),
+            "",
+        )
+        if not segment_path:
+            results.append(
+                _probe_failure(
+                    "hls-playlist",
+                    playlist_url,
+                    status_code,
+                    elapsed_ms,
+                    "HLS playlist loaded but did not contain any audio segments",
+                )
+            )
+            return results
+        add_ok("hls-playlist", playlist_url, status_code, elapsed_ms, "HLS playlist loaded", {"segment": segment_path})
+
+        segment_url = urljoin(base, segment_path)
+        status_code, body, elapsed_ms, final_url = _request(
+            opener,
+            segment_url,
+            timeout_seconds=timeout_seconds,
+            accept="audio/*,video/mp2t,*/*",
+            headers=auth_headers,
+        )
+        if status_code != 200 or len(body) < 256:
+            results.append(
+                _probe_failure(
+                    "hls-segment",
+                    segment_url,
+                    status_code,
+                    elapsed_ms,
+                    f"HLS segment returned HTTP {status_code} with {len(body)} bytes",
+                )
+            )
+            return results
+        add_ok("hls-segment", segment_url, status_code, elapsed_ms, "HLS segment loaded", {"bytes": len(body)})
+        return results
+    except URLError as exc:
+        results.append(_probe_failure("client-routes", base, None, 0, str(exc.reason or exc)))
+        return results
+    except Exception as exc:
+        results.append(_probe_failure("client-routes", base, None, 0, str(exc)))
+        return results
+
+
+def _restart_container(docker_socket_path: str, container_name: str, *, timeout_seconds: int = 10):
+    request_path = f"/containers/{quote(container_name, safe='')}/restart?t={max(1, int(timeout_seconds))}"
+    request = (
+        f"POST {request_path} HTTP/1.1\r\n"
+        "Host: docker\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(max(2.0, float(timeout_seconds) + 2.0))
+        client.connect(docker_socket_path)
+        client.sendall(request)
+        response = bytearray()
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+    status_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    try:
+        status_code = int(status_line.split(" ", 2)[1])
+    except Exception as exc:
+        raise RuntimeError(f"Unparseable Docker response: {status_line}") from exc
+    if status_code not in {200, 204, 304}:
+        raise RuntimeError(f"Docker restart failed: {status_line}")
+
+
+def maybe_remediate_server(
+    *,
+    enabled: bool,
+    state_path: str,
+    cooldown_seconds: float,
+    docker_socket_path: str,
+    container_name: str,
+    reason: str,
+    now: float | None = None,
+    restart_container=_restart_container,
+):
+    current_time = float(time.time() if now is None else now)
+    if not enabled:
+        return {"attempted": False, "status": "disabled"}
+
+    state = _load_state(state_path)
+    last_attempt_at = float(state.get("last_server_restart_at") or 0.0)
+    if last_attempt_at and (current_time - last_attempt_at) < max(1.0, float(cooldown_seconds)):
+        return {
+            "attempted": False,
+            "status": "cooldown",
+            "remaining_seconds": max(0.0, float(cooldown_seconds) - (current_time - last_attempt_at)),
+        }
+
+    restart_container(docker_socket_path, container_name)
+    state["last_server_restart_at"] = current_time
+    state["last_server_restart_reason"] = reason
+    _save_state(state_path, state)
+    return {"attempted": True, "status": "restarted"}
+
+
+def _load_email_alert_config() -> EmailAlertConfig:
+    mail_to = _split_csv(os.getenv("ROOMCAST_ALERT_EMAIL_TO"))
+    smtp_host = os.getenv("ROOMCAST_ALERT_SMTP_HOST", "").strip()
+    smtp_username = os.getenv("ROOMCAST_ALERT_SMTP_USERNAME", "").strip()
+    enabled_default = bool(smtp_host and mail_to)
+    return EmailAlertConfig(
+        enabled=_bool_env("ROOMCAST_ALERT_EMAIL_ENABLED", enabled_default),
+        smtp_host=smtp_host,
+        smtp_port=int(os.getenv("ROOMCAST_ALERT_SMTP_PORT", "587")),
+        smtp_username=smtp_username,
+        smtp_password=os.getenv("ROOMCAST_ALERT_SMTP_PASSWORD", ""),
+        smtp_starttls=_bool_env("ROOMCAST_ALERT_SMTP_STARTTLS", True),
+        mail_from=os.getenv("ROOMCAST_ALERT_EMAIL_FROM", smtp_username or "roomcast-watchdog@localhost").strip(),
+        mail_to=mail_to,
+        subject_prefix=os.getenv("ROOMCAST_ALERT_SUBJECT_PREFIX", "[RoomCast]").strip() or "[RoomCast]",
+        cooldown_seconds=float(os.getenv("ROOMCAST_ALERT_COOLDOWN_SECONDS", "900")),
+        send_resolved=_bool_env("ROOMCAST_ALERT_RESOLVED_ENABLED", True),
+    )
+
+
+def _issue_key(alert: dict) -> str:
+    return "|".join(
+        [
+            str(alert.get("category", "")),
+            str(alert.get("code", "")),
+            str(alert.get("room_slug", "")),
+            str(alert.get("host_slug", "")),
+            str(alert.get("url", "")),
+        ]
+    )
+
+
+def _severity_rank(severity: str) -> int:
+    return {"critical": 3, "error": 2, "warn": 1, "info": 0}.get((severity or "").lower(), 0)
+
+
+def _render_alert_email(
+    *,
+    subject: str,
+    title: str,
+    intro: str,
+    alerts: list[dict],
+    remediation: dict,
+    hostname: str,
+):
+    now = datetime.now(timezone.utc).astimezone()
+    rows = []
+    for alert in alerts:
+        details = alert.get("details") or {}
+        details_text = "<br>".join(
+            f"<strong>{html.escape(str(key))}:</strong> {html.escape(str(value))}" for key, value in sorted(details.items())
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(alert.get('severity', '')))}</td>"
+            f"<td>{html.escape(str(alert.get('category', '')))}</td>"
+            f"<td>{html.escape(str(alert.get('code', '')))}</td>"
+            f"<td>{html.escape(str(alert.get('message', '')))}</td>"
+            f"<td>{details_text}</td>"
+            "</tr>"
+        )
+
+    remediation_html = ""
+    if remediation:
+        remediation_html = (
+            "<p><strong>Remediation:</strong> "
+            f"{html.escape(str(remediation.get('status', 'not-needed')))}"
+            f"{' on ' + html.escape(str(remediation.get('target'))) if remediation.get('target') else ''}"
+            "</p>"
+        )
+
+    html_body = f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;background:#f5f7fb;color:#18202f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+    <div style="max-width:760px;margin:0 auto;padding:28px;">
+      <div style="background:#101827;color:#ffffff;border-radius:18px 18px 0 0;padding:24px 28px;">
+        <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#a8b3c7;">RoomCast Watchdog</div>
+        <h1 style="margin:8px 0 0;font-size:26px;line-height:1.2;">{html.escape(title)}</h1>
+      </div>
+      <div style="background:#ffffff;border:1px solid #dce2ee;border-top:0;border-radius:0 0 18px 18px;padding:24px 28px;">
+        <p style="font-size:16px;line-height:1.5;margin-top:0;">{html.escape(intro)}</p>
+        <p><strong>Host:</strong> {html.escape(hostname)}<br>
+           <strong>Time:</strong> {html.escape(now.strftime('%Y-%m-%d %H:%M:%S %Z'))}</p>
+        {remediation_html}
+        <table style="border-collapse:collapse;width:100%;font-size:14px;">
+          <thead>
+            <tr>
+              <th align="left" style="border-bottom:1px solid #dce2ee;padding:8px;">Severity</th>
+              <th align="left" style="border-bottom:1px solid #dce2ee;padding:8px;">Area</th>
+              <th align="left" style="border-bottom:1px solid #dce2ee;padding:8px;">Code</th>
+              <th align="left" style="border-bottom:1px solid #dce2ee;padding:8px;">Message</th>
+              <th align="left" style="border-bottom:1px solid #dce2ee;padding:8px;">Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows)}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+    text_lines = [title, "", intro, "", f"Host: {hostname}", f"Time: {now.isoformat()}"]
+    if remediation:
+        text_lines.extend(["", f"Remediation: {remediation.get('status', 'not-needed')}"])
+    for alert in alerts:
+        text_lines.extend(
+            [
+                "",
+                f"{alert.get('severity', '').upper()} {alert.get('category', '')}/{alert.get('code', '')}",
+                str(alert.get("message", "")),
+                json.dumps(alert.get("details") or {}, sort_keys=True),
+            ]
+        )
+    return subject, "\n".join(text_lines), html_body
+
+
+def _send_email(config: EmailAlertConfig, *, subject: str, text_body: str, html_body: str):
+    if not config.smtp_host:
+        raise RuntimeError("ROOMCAST_ALERT_SMTP_HOST is not configured")
+    if not config.mail_to:
+        raise RuntimeError("ROOMCAST_ALERT_EMAIL_TO is not configured")
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = config.mail_from
+    message["To"] = ", ".join(config.mail_to)
+    message.set_content(text_body)
+    message.add_alternative(html_body, subtype="html")
+
+    with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=15) as smtp:
+        if config.smtp_starttls:
+            smtp.starttls()
+        if config.smtp_username or config.smtp_password:
+            smtp.login(config.smtp_username, config.smtp_password)
+        smtp.send_message(message)
+
+
+def maybe_send_email_alerts(
+    *,
+    config: EmailAlertConfig,
+    state_path: str,
+    alerts: list[dict],
+    remediation: dict,
+    hostname: str | None = None,
+    now: float | None = None,
+    send_email=_send_email,
+):
+    if not config.enabled:
+        return {"attempted": False, "status": "disabled"}
+    if not config.smtp_host or not config.mail_to:
+        return {"attempted": False, "status": "not-configured"}
+
+    current_time = float(time.time() if now is None else now)
+    hostname = hostname or socket.gethostname()
+    state = _load_state(state_path)
+    alert_state = state.setdefault("email_alerts", {})
+    open_keys = {_issue_key(alert) for alert in alerts}
+    previous_open = {key for key, value in alert_state.items() if value.get("open")}
+
+    send_active = []
+    for alert in alerts:
+        key = _issue_key(alert)
+        previous = alert_state.get(key, {})
+        last_sent_at = float(previous.get("last_sent_at") or 0.0)
+        if not previous.get("open") or (current_time - last_sent_at) >= max(1.0, config.cooldown_seconds):
+            send_active.append(alert)
+
+    resolved_keys = sorted(previous_open - open_keys)
+    if send_active:
+        subject = f"{config.subject_prefix} RoomCast needs attention"
+        _, text_body, html_body = _render_alert_email(
+            subject=subject,
+            title="RoomCast Needs Attention",
+            intro="The watchdog found one or more problems that can affect listeners.",
+            alerts=send_active,
+            remediation=remediation,
+            hostname=hostname,
+        )
+        send_email(config, subject=subject, text_body=text_body, html_body=html_body)
+        for alert in alerts:
+            key = _issue_key(alert)
+            alert_state[key] = {
+                "open": True,
+                "last_seen_at": current_time,
+                "last_message": alert.get("message", ""),
+                "last_sent_at": current_time if alert in send_active else alert_state.get(key, {}).get("last_sent_at"),
+            }
+        for key in resolved_keys:
+            alert_state[key]["open"] = False
+            alert_state[key]["resolved_at"] = current_time
+        _save_state(state_path, state)
+        return {"attempted": True, "status": "sent", "sent_count": len(send_active)}
+
+    if resolved_keys and config.send_resolved:
+        resolved_alerts = [
+            {
+                "severity": "info",
+                "category": "resolved",
+                "code": key,
+                "message": alert_state.get(key, {}).get("last_message") or "Issue resolved.",
+                "details": {},
+            }
+            for key in resolved_keys
+        ]
+        subject = f"{config.subject_prefix} RoomCast recovered"
+        _, text_body, html_body = _render_alert_email(
+            subject=subject,
+            title="RoomCast Recovered",
+            intro="Previously reported watchdog issues are no longer active.",
+            alerts=resolved_alerts,
+            remediation={},
+            hostname=hostname,
+        )
+        send_email(config, subject=subject, text_body=text_body, html_body=html_body)
+        for key in resolved_keys:
+            alert_state[key]["open"] = False
+            alert_state[key]["resolved_at"] = current_time
+            alert_state[key]["resolved_sent_at"] = current_time
+        for alert in alerts:
+            key = _issue_key(alert)
+            alert_state[key] = {
+                "open": True,
+                "last_seen_at": current_time,
+                "last_message": alert.get("message", ""),
+                "last_sent_at": alert_state.get(key, {}).get("last_sent_at"),
+            }
+        _save_state(state_path, state)
+        return {"attempted": True, "status": "resolved-sent", "sent_count": len(resolved_alerts)}
+
+    for alert in alerts:
+        key = _issue_key(alert)
+        existing = alert_state.setdefault(key, {})
+        existing.update(
+            {
+                "open": True,
+                "last_seen_at": current_time,
+                "last_message": alert.get("message", ""),
+            }
+        )
+    for key in resolved_keys:
+        alert_state[key]["open"] = False
+        alert_state[key]["resolved_at"] = current_time
+    _save_state(state_path, state)
+    return {"attempted": False, "status": "cooldown" if alerts else "ok"}
+
+
 def evaluate_hosts(store: RoomCastStore, *, heartbeat_stale_seconds: int, startup_grace_seconds: int):
     now = datetime.now(timezone.utc)
     heartbeat_cutoff = now - timedelta(seconds=max(5, heartbeat_stale_seconds))
@@ -47,6 +726,7 @@ def evaluate_hosts(store: RoomCastStore, *, heartbeat_stale_seconds: int, startu
         current_device = (runtime.get("current_device") or "").strip()
         last_error = (runtime.get("last_error") or "").strip()
         device_order = host.get("device_order") or []
+        preferred_pattern = (host.get("preferred_audio_pattern") or "").strip()
 
         if desired_active and not online:
             issues.append(
@@ -93,6 +773,21 @@ def evaluate_hosts(store: RoomCastStore, *, heartbeat_stale_seconds: int, startu
                 )
             )
 
+        if desired_active and online and current_device and preferred_pattern:
+            if preferred_pattern.casefold() not in current_device.casefold():
+                issues.append(
+                    WatchdogIssue(
+                        severity="warn",
+                        host_slug=host_slug,
+                        room_slug=room_slug,
+                        code="preferred-device-missing",
+                        message=(
+                            f"{host['label']} is using {current_device}; "
+                            f"expected an input matching {preferred_pattern}."
+                        ),
+                    )
+                )
+
         if online and current_device and device_order and current_device not in device_order:
             issues.append(
                 WatchdogIssue(
@@ -113,6 +808,11 @@ def main():
     parser.add_argument("--heartbeat-stale-seconds", type=int, default=45, help="Seconds before a host is considered stale")
     parser.add_argument("--startup-grace-seconds", type=int, default=25, help="Grace period before treating a desired-active host as failed")
     parser.add_argument("--record-incidents", action="store_true", help="Write detected issues into meeting_incidents")
+    parser.add_argument("--base-url", default=os.getenv("ROOMCAST_WATCHDOG_BASE_URL", "http://roomcast:1967"), help="Base URL used for public route probes")
+    parser.add_argument("--public-pin", default=os.getenv("ROOMCAST_WATCHDOG_PUBLIC_PIN", os.getenv("ROOMCAST_DEFAULT_PIN", "7070")), help="PIN used for public client probes")
+    parser.add_argument("--skip-client-probe", action="store_true", help="Skip public client/HLS route checks")
+    parser.add_argument("--client-timeout-seconds", type=float, default=float(os.getenv("ROOMCAST_WATCHDOG_CLIENT_TIMEOUT_SECONDS", "4")), help="Timeout for public route probes")
+    parser.add_argument("--hls-timeout-seconds", type=float, default=float(os.getenv("ROOMCAST_WATCHDOG_HLS_TIMEOUT_SECONDS", "12")), help="Timeout for active HLS playlist probes")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args()
 
@@ -122,6 +822,85 @@ def main():
         heartbeat_stale_seconds=args.heartbeat_stale_seconds,
         startup_grace_seconds=args.startup_grace_seconds,
     )
+    health_url = os.getenv("ROOMCAST_WATCHDOG_HEALTH_URL", "http://roomcast:1967/healthz")
+    health_timeout_seconds = float(os.getenv("ROOMCAST_WATCHDOG_HEALTH_TIMEOUT_SECONDS", "3"))
+    remediation_enabled = os.getenv("ROOMCAST_WATCHDOG_REMEDIATION_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    remediation_state_path = os.getenv("ROOMCAST_WATCHDOG_STATE_PATH", "/app/data/watchdog-state.json")
+    remediation_cooldown_seconds = float(os.getenv("ROOMCAST_WATCHDOG_RESTART_COOLDOWN_SECONDS", "180"))
+    docker_socket_path = os.getenv("ROOMCAST_WATCHDOG_DOCKER_SOCKET", "/var/run/docker.sock")
+    restart_target = os.getenv("ROOMCAST_WATCHDOG_RESTART_TARGET", "roomcast")
+    health = check_server_health(health_url, timeout_seconds=health_timeout_seconds)
+    client_probes = [] if args.skip_client_probe else check_client_routes(
+        args.base_url,
+        public_pin=args.public_pin,
+        timeout_seconds=args.client_timeout_seconds,
+        hls_timeout_seconds=args.hls_timeout_seconds,
+    )
+    failed_client_probes = [probe for probe in client_probes if not probe.ok]
+    remediation = {"attempted": False, "status": "not-needed"}
+
+    if not health.ok or failed_client_probes:
+        restart_reason = health.message if not health.ok else failed_client_probes[0].message
+        if args.record_incidents:
+            if not health.ok:
+                store.record_event(
+                    component="watchdog",
+                    event_type="server-health-failed",
+                    message=f"RoomCast health check failed: {health.message}",
+                    level="critical",
+                    details={"health_url": health_url, "status_code": health.status_code},
+                )
+            for probe in failed_client_probes:
+                store.record_event(
+                    component="watchdog",
+                    event_type=f"client-probe-{probe.name}-failed",
+                    message=f"RoomCast client probe failed: {probe.message}",
+                    level="critical",
+                    details={
+                        "url": probe.url,
+                        "status_code": probe.status_code,
+                        "elapsed_ms": probe.elapsed_ms,
+                        **probe.details,
+                    },
+                )
+        try:
+            remediation = maybe_remediate_server(
+                enabled=remediation_enabled,
+                state_path=remediation_state_path,
+                cooldown_seconds=remediation_cooldown_seconds,
+                docker_socket_path=docker_socket_path,
+                container_name=restart_target,
+                reason=restart_reason,
+            )
+        except Exception as exc:
+            remediation = {"attempted": True, "status": "failed", "error": str(exc)}
+        remediation["target"] = restart_target
+
+        if args.record_incidents:
+            event_type = {
+                "restarted": "server-restart-requested",
+                "cooldown": "server-restart-skipped",
+                "disabled": "server-restart-disabled",
+                "failed": "server-restart-failed",
+            }.get(remediation.get("status"), "server-restart-status")
+            level = "info" if remediation.get("status") == "restarted" else "warn"
+            if remediation.get("status") == "failed":
+                level = "critical"
+            details = {
+                "target": restart_target,
+                "status": remediation.get("status"),
+            }
+            if "remaining_seconds" in remediation:
+                details["remaining_seconds"] = remediation["remaining_seconds"]
+            if "error" in remediation:
+                details["error"] = remediation["error"]
+            store.record_event(
+                component="watchdog",
+                event_type=event_type,
+                message=f"RoomCast remediation status: {remediation.get('status')}",
+                level=level,
+                details=details,
+            )
 
     if args.record_incidents:
         for issue in issues:
@@ -141,20 +920,89 @@ def main():
                 details={"severity": issue.severity},
             )
 
+    email_alerts = []
+    if not health.ok:
+        email_alerts.append(
+            {
+                "severity": "critical",
+                "category": "server",
+                "code": "healthz",
+                "message": health.message,
+                "url": health_url,
+                "details": {"status_code": health.status_code},
+            }
+        )
+    for probe in failed_client_probes:
+        email_alerts.append(
+            {
+                "severity": "critical",
+                "category": "client-route",
+                "code": probe.name,
+                "message": probe.message,
+                "url": probe.url,
+                "details": {
+                    "status_code": probe.status_code,
+                    "elapsed_ms": probe.elapsed_ms,
+                    **probe.details,
+                },
+            }
+        )
+    for issue in issues:
+        email_alerts.append(
+            {
+                "severity": issue.severity,
+                "category": "host",
+                "code": issue.code,
+                "message": issue.message,
+                "room_slug": issue.room_slug,
+                "host_slug": issue.host_slug,
+                "details": {},
+            }
+        )
+
+    email_status = {"attempted": False, "status": "not-needed"}
+    try:
+        email_status = maybe_send_email_alerts(
+            config=_load_email_alert_config(),
+            state_path=remediation_state_path,
+            alerts=email_alerts,
+            remediation=remediation,
+        )
+    except Exception as exc:
+        email_status = {"attempted": True, "status": "failed", "error": str(exc)}
+        if args.record_incidents:
+            store.record_event(
+                component="watchdog",
+                event_type="email-alert-failed",
+                message=f"RoomCast email alert failed: {exc}",
+                level="warn",
+                details={},
+            )
+
     if args.json:
         payload = {
-            "ok": not issues,
+            "ok": not issues and health.ok and not failed_client_probes,
             "issue_count": len(issues),
             "issues": [asdict(issue) for issue in issues],
+            "server_health": asdict(health),
+            "client_probes": [asdict(probe) for probe in client_probes],
+            "remediation": remediation,
+            "email_alerts": email_status,
         }
         print(json.dumps(payload, indent=2))
     else:
-        if not issues:
+        if not issues and health.ok and not failed_client_probes:
             print("OK: RoomCast hosts are healthy.")
         else:
             for issue in issues:
                 print(f"{issue.severity.upper()} {issue.host_slug} {issue.code}: {issue.message}")
+            if not health.ok:
+                print(f"CRITICAL server-health: {health.message}")
+            for probe in failed_client_probes:
+                print(f"CRITICAL {probe.name}: {probe.message}")
 
+    if not health.ok or failed_client_probes:
+        raise SystemExit(2)
     if any(issue.severity == "critical" for issue in issues):
         raise SystemExit(2)
     if issues:

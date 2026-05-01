@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from roomcast_agent import RoomCastAgent
 
@@ -23,6 +25,8 @@ class RoomCastAgentTests(unittest.TestCase):
             test_tone=True,
         )
         agent.lock_path = self.lock_path
+        agent.os_name = "nt"
+        agent.platform_name = "win32"
         return agent
 
     def test_second_agent_instance_is_rejected(self):
@@ -104,6 +108,21 @@ class RoomCastAgentTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ac") + 1], "1")
         self.assertEqual(command[command.index("-b:a") + 1], "128k")
 
+    def test_microphone_array_devices_get_bench_gain_filters(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Microphone Array (AMD Audio Device)",
+        )
+
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertEqual(
+            command[command.index("-af") + 1],
+            "highpass=f=120,volume=14.0dB,alimiter=limit=0.92,silencedetect=noise=-45dB:d=45",
+        )
+
     def test_stereo_mix_devices_keep_stereo(self):
         agent = self._make_agent()
         agent.test_tone = False
@@ -120,6 +139,7 @@ class RoomCastAgentTests(unittest.TestCase):
         agent = self._make_agent()
         agent.test_tone = False
         agent.host_slug = "hp-envy-16-ad0xx"
+        agent.capture_sample_rate_hz = 48000
 
         command = agent._build_ffmpeg_command(
             "https://example.com/webcall/api/source/ingest/test-host",
@@ -128,8 +148,26 @@ class RoomCastAgentTests(unittest.TestCase):
         )
 
         self.assertEqual(command[command.index("-ac") + 1], "2")
+        self.assertEqual(command[command.index("-sample_rate") + 1], "48000")
+        self.assertEqual(command[command.index("-channels") + 1], "2")
         self.assertEqual(command[command.index("-ar") + 1], "48000")
         self.assertNotIn("pan=mono|c0=c0", command)
+
+    def test_cq_devices_can_request_96khz_capture(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+        agent.host_slug = "hp-pavilion-14m-ba1xx"
+        agent.capture_sample_rate_hz = 96000
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "CQ 1&2 (CQ18T)",
+            "wav_pcm24",
+        )
+
+        self.assertEqual(command[command.index("-sample_rate") + 1], "96000")
+        self.assertEqual(command[command.index("-channels") + 1], "2")
+        self.assertEqual(command[command.index("-ar") + 1], "96000")
 
     def test_wav_pcm24_profile_uses_raw_pcm_transport(self):
         agent = self._make_agent()
@@ -149,6 +187,45 @@ class RoomCastAgentTests(unittest.TestCase):
         self.assertIn("-content_type", command)
         self.assertEqual(command[command.index("-content_type") + 1], "application/octet-stream")
         self.assertEqual(command[command.index("-method") + 1], "POST")
+
+    def test_macos_list_devices_parses_avfoundation_audio_devices(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+        agent.os_name = "posix"
+        agent.platform_name = "darwin"
+        avfoundation_output = """
+[AVFoundation indev @ 0x0] AVFoundation video devices:
+[AVFoundation indev @ 0x0] [0] FaceTime HD Camera
+[AVFoundation indev @ 0x0] AVFoundation audio devices:
+[AVFoundation indev @ 0x0] [0] MacBook Pro Microphone
+[AVFoundation indev @ 0x0] [1] Scarlett 2i2 USB
+"""
+        with patch("roomcast_agent.subprocess.run", return_value=SimpleNamespace(stdout="", stderr=avfoundation_output, returncode=1)):
+            devices = agent.list_audio_devices()
+
+        self.assertEqual(devices, ["MacBook Pro Microphone", "Scarlett 2i2 USB"])
+        self.assertEqual(agent.cached_device_inputs["MacBook Pro Microphone"], ":0")
+        self.assertEqual(agent.cached_device_inputs["Scarlett 2i2 USB"], ":1")
+
+    def test_macos_build_ffmpeg_command_uses_avfoundation_audio_index(self):
+        agent = self._make_agent()
+        agent.test_tone = False
+        agent.os_name = "posix"
+        agent.platform_name = "darwin"
+        agent.capture_sample_rate_hz = 48000
+        agent.cached_device_inputs = {"Scarlett 2i2 USB": ":1"}
+
+        command = agent._build_ffmpeg_command(
+            "https://example.com/webcall/api/source/ingest/test-host",
+            "Scarlett 2i2 USB",
+            "wav_pcm24",
+        )
+
+        self.assertIn("-f", command)
+        self.assertEqual(command[command.index("-f") + 1], "avfoundation")
+        self.assertEqual(command[command.index("-i") + 1], ":1")
+        self.assertEqual(command[command.index("-ar") + 1], "48000")
+        self.assertEqual(command[command.index("-ac") + 1], "1")
 
 
 if __name__ == "__main__":
