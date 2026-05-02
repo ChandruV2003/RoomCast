@@ -235,6 +235,41 @@ class RoomCastStoreTests(unittest.TestCase):
         self.assertEqual(report["incident_count"], 1)
         self.assertEqual(report["listeners"][0]["participant_label"], "Web 127.0.0.1")
 
+    def test_audio_level_samples_are_available_for_reports_and_summary(self):
+        self.store.sync_meeting_state(
+            "meeting-hall",
+            active=True,
+            host_slug="hp-pavilion-14m-ba1xx",
+            trigger_mode="watchdog",
+            actor="test",
+        )
+        meeting_id = self.store.get_active_meeting()["id"]
+
+        self.store.record_audio_level_sample(
+            "meeting-hall",
+            host_slug="hp-pavilion-14m-ba1xx",
+            signal_level_db=-28.0,
+            signal_peak_db=-8.0,
+            signal_level_percent=68.0,
+            signal_peak_percent=91.0,
+            listener_count=2,
+            broadcasting=True,
+            is_ingesting=True,
+            desired_active=True,
+            current_device="CQ 1&2 (CQ18T)",
+            stream_transport="hls",
+            connection_quality_percent=100.0,
+            connection_quality_label="Buffered",
+        )
+
+        summary = self.store.audio_level_summary("meeting-hall", window_seconds=300)
+        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual(summary["max_signal_level_db"], -28.0)
+
+        report = self.store.get_meeting_report(meeting_id)
+        self.assertEqual(len(report["audio_levels"]), 1)
+        self.assertEqual(report["audio_levels"][0]["signal_peak_db"], -8.0)
+
     def test_record_heartbeat_logs_runtime_changes(self):
         self.store.record_heartbeat(
             "hp-pavilion-14m-ba1xx",

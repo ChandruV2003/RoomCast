@@ -115,6 +115,15 @@ def _split_csv(value: str | None) -> list[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
+def _float_or_none(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def check_server_health(health_url: str, *, timeout_seconds: float = 3.0):
     try:
         with urlopen(health_url, timeout=max(0.5, float(timeout_seconds))) as response:
@@ -298,10 +307,21 @@ def check_client_routes(
             elapsed_ms,
             "live status loaded",
             {
+                "room_slug": live_status.get("slug") or live_status.get("room_slug"),
+                "host_slug": live_status.get("host_slug"),
+                "room_alias": live_status.get("room_alias") or live_status.get("label"),
                 "broadcasting": bool(live_status.get("broadcasting")),
                 "is_ingesting": bool(live_status.get("is_ingesting")),
                 "desired_active": bool(live_status.get("desired_active")),
+                "listener_count": live_status.get("listener_count"),
+                "current_device": live_status.get("current_device"),
+                "stream_transport": live_status.get("stream_transport"),
+                "connection_quality_percent": live_status.get("connection_quality_percent"),
+                "connection_quality_label": live_status.get("connection_quality_label"),
+                "signal_level_db": live_status.get("signal_level_db"),
+                "signal_peak_db": live_status.get("signal_peak_db"),
                 "signal_level_percent": live_status.get("signal_level_percent"),
+                "signal_peak_percent": live_status.get("signal_peak_percent"),
             },
         )
 
@@ -398,6 +418,98 @@ def check_client_routes(
     except Exception as exc:
         results.append(_probe_failure("client-routes", base, None, 0, str(exc)))
         return results
+
+
+def record_audio_level_monitoring(
+    store: RoomCastStore,
+    client_probes: list[EndpointProbeResult],
+    *,
+    low_level_db: float = -42.0,
+    hot_peak_db: float = -1.0,
+    window_seconds: int = 300,
+    min_samples: int = 3,
+    retain_days: int = 14,
+):
+    live_probe = next((probe for probe in client_probes if probe.ok and probe.name == "live-status"), None)
+    if not live_probe:
+        return {"recorded": False, "issues": [], "reason": "live-status-unavailable"}
+
+    details = live_probe.details or {}
+    room_slug = (details.get("room_slug") or "").strip()
+    if not room_slug:
+        return {"recorded": False, "issues": [], "reason": "room-unavailable"}
+
+    host_slug = (details.get("host_slug") or "").strip() or None
+    signal_level_db = _float_or_none(details.get("signal_level_db"))
+    signal_peak_db = _float_or_none(details.get("signal_peak_db"))
+    signal_level_percent = _float_or_none(details.get("signal_level_percent"))
+    signal_peak_percent = _float_or_none(details.get("signal_peak_percent"))
+    active = bool(details.get("broadcasting") or details.get("is_ingesting") or details.get("desired_active"))
+
+    sample_id = store.record_audio_level_sample(
+        room_slug,
+        host_slug=host_slug,
+        source="watchdog",
+        signal_level_db=signal_level_db,
+        signal_peak_db=signal_peak_db,
+        signal_level_percent=signal_level_percent,
+        signal_peak_percent=signal_peak_percent,
+        listener_count=int(details.get("listener_count") or 0),
+        broadcasting=bool(details.get("broadcasting")),
+        is_ingesting=bool(details.get("is_ingesting")),
+        desired_active=bool(details.get("desired_active")),
+        current_device=str(details.get("current_device") or ""),
+        stream_transport=str(details.get("stream_transport") or ""),
+        connection_quality_percent=_float_or_none(details.get("connection_quality_percent")),
+        connection_quality_label=str(details.get("connection_quality_label") or ""),
+    )
+    store.prune_audio_level_samples(retain_days=retain_days)
+
+    summary = store.audio_level_summary(room_slug, window_seconds=window_seconds)
+    sample_count = int(summary.get("sample_count") or 0)
+    max_signal_level_db = _float_or_none(summary.get("max_signal_level_db"))
+    max_signal_peak_db = _float_or_none(summary.get("max_signal_peak_db"))
+    room_label = details.get("room_alias") or room_slug
+    issues: list[WatchdogIssue] = []
+
+    if active and sample_count >= max(1, int(min_samples)) and max_signal_level_db is not None and max_signal_level_db < low_level_db:
+        issues.append(
+            WatchdogIssue(
+                severity="warn",
+                host_slug=host_slug or "",
+                room_slug=room_slug,
+                code="low-program-level",
+                message=(
+                    f"{room_label} program audio stayed below {low_level_db:.1f} dBFS "
+                    f"for {sample_count} watchdog samples."
+                ),
+            )
+        )
+
+    if active and sample_count >= max(1, int(min_samples)) and max_signal_peak_db is not None and max_signal_peak_db > hot_peak_db:
+        issues.append(
+            WatchdogIssue(
+                severity="warn",
+                host_slug=host_slug or "",
+                room_slug=room_slug,
+                code="hot-program-peak",
+                message=(
+                    f"{room_label} program audio peaked above {hot_peak_db:.1f} dBFS "
+                    f"in the recent watchdog window."
+                ),
+            )
+        )
+
+    return {
+        "recorded": True,
+        "sample_id": sample_id,
+        "room_slug": room_slug,
+        "host_slug": host_slug,
+        "signal_level_db": signal_level_db,
+        "signal_peak_db": signal_peak_db,
+        "summary": summary,
+        "issues": issues,
+    }
 
 
 def _restart_container(docker_socket_path: str, container_name: str, *, timeout_seconds: int = 10):
@@ -813,6 +925,12 @@ def main():
     parser.add_argument("--skip-client-probe", action="store_true", help="Skip public client/HLS route checks")
     parser.add_argument("--client-timeout-seconds", type=float, default=float(os.getenv("ROOMCAST_WATCHDOG_CLIENT_TIMEOUT_SECONDS", "4")), help="Timeout for public route probes")
     parser.add_argument("--hls-timeout-seconds", type=float, default=float(os.getenv("ROOMCAST_WATCHDOG_HLS_TIMEOUT_SECONDS", "12")), help="Timeout for active HLS playlist probes")
+    parser.add_argument("--record-audio-levels", action=argparse.BooleanOptionalAction, default=_bool_env("ROOMCAST_LEVEL_MONITOR_ENABLED", True), help="Persist watchdog audio level samples")
+    parser.add_argument("--level-low-db", type=float, default=float(os.getenv("ROOMCAST_LEVEL_MONITOR_LOW_DB", "-42")), help="Warn when recent program level remains below this dBFS value")
+    parser.add_argument("--level-hot-peak-db", type=float, default=float(os.getenv("ROOMCAST_LEVEL_MONITOR_HOT_PEAK_DB", "-1")), help="Warn when recent program peaks exceed this dBFS value")
+    parser.add_argument("--level-window-seconds", type=int, default=int(os.getenv("ROOMCAST_LEVEL_MONITOR_WINDOW_SECONDS", "300")), help="Rolling level monitor window")
+    parser.add_argument("--level-min-samples", type=int, default=int(os.getenv("ROOMCAST_LEVEL_MONITOR_MIN_SAMPLES", "3")), help="Minimum samples before level monitor warnings")
+    parser.add_argument("--level-retain-days", type=int, default=int(os.getenv("ROOMCAST_LEVEL_MONITOR_RETAIN_DAYS", "14")), help="Days to retain level monitor samples")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args()
 
@@ -837,6 +955,18 @@ def main():
         hls_timeout_seconds=args.hls_timeout_seconds,
     )
     failed_client_probes = [probe for probe in client_probes if not probe.ok]
+    level_monitor = {"recorded": False, "issues": []}
+    if args.record_audio_levels and not args.skip_client_probe:
+        level_monitor = record_audio_level_monitoring(
+            store,
+            client_probes,
+            low_level_db=args.level_low_db,
+            hot_peak_db=args.level_hot_peak_db,
+            window_seconds=args.level_window_seconds,
+            min_samples=args.level_min_samples,
+            retain_days=args.level_retain_days,
+        )
+        issues.extend(level_monitor.get("issues") or [])
     remediation = {"attempted": False, "status": "not-needed"}
 
     if not health.ok or failed_client_probes:
@@ -986,6 +1116,10 @@ def main():
             "issues": [asdict(issue) for issue in issues],
             "server_health": asdict(health),
             "client_probes": [asdict(probe) for probe in client_probes],
+            "level_monitor": {
+                **level_monitor,
+                "issues": [asdict(issue) for issue in level_monitor.get("issues", [])],
+            },
             "remediation": remediation,
             "email_alerts": email_status,
         }

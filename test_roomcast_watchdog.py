@@ -14,7 +14,9 @@ from roomcast_watchdog import (
     evaluate_hosts,
     maybe_remediate_server,
     maybe_send_email_alerts,
+    record_audio_level_monitoring,
 )
+from roomcast_store import RoomCastStore
 
 
 class _ProbeHandler(BaseHTTPRequestHandler):
@@ -53,8 +55,12 @@ class _ProbeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             active = "true" if self.status_active else "false"
             payload = (
-                '{"broadcasting": %s, "is_ingesting": false, '
-                '"desired_active": false, "signal_level_percent": 72}'
+                '{"slug": "meeting-hall", "host_slug": "hp-pavilion-14m-ba1xx", '
+                '"room_alias": "Room B", "broadcasting": %s, "is_ingesting": false, '
+                '"desired_active": false, "listener_count": 1, "current_device": "CQ 1&2", '
+                '"stream_transport": "hls", "connection_quality_percent": 100, '
+                '"connection_quality_label": "Buffered", "signal_level_db": -24.5, '
+                '"signal_peak_db": -6.5, "signal_level_percent": 72, "signal_peak_percent": 91}'
             ) % active
             self.wfile.write(payload.encode("utf-8"))
             return
@@ -217,6 +223,30 @@ class RoomCastWatchdogTests(unittest.TestCase):
 
         self.assertTrue(all(result.ok for result in results))
         self.assertEqual([result.name for result in results], ["public-page", "live-status", "hls-playlist", "hls-segment"])
+        live_status = next(result for result in results if result.name == "live-status")
+        self.assertEqual(live_status.details["room_slug"], "meeting-hall")
+        self.assertEqual(live_status.details["signal_level_db"], -24.5)
+
+    def test_record_audio_level_monitoring_persists_live_status_samples(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            store = RoomCastStore(str(Path(tempdir) / "roomcast.db"))
+            with _ProbeServer() as server:
+                results = check_client_routes(server.base_url, public_pin="7070", timeout_seconds=1, hls_timeout_seconds=1)
+
+            monitor = record_audio_level_monitoring(
+                store,
+                results,
+                low_level_db=-42,
+                hot_peak_db=-1,
+                window_seconds=300,
+                min_samples=1,
+            )
+
+            self.assertTrue(monitor["recorded"])
+            self.assertEqual(monitor["issues"], [])
+            summary = store.audio_level_summary("meeting-hall", window_seconds=300)
+            self.assertEqual(summary["sample_count"], 1)
+            self.assertEqual(summary["max_signal_level_db"], -24.5)
 
     def test_check_client_routes_handles_secure_session_cookie_over_internal_http(self):
         with _ProbeServer(secure_redirect=True) as server:

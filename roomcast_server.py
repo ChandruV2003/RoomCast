@@ -3656,6 +3656,19 @@ def create_app(test_config: dict | None = None, *, store: RoomCastStore | None =
                 incident["host_slug"] or "",
                 incident["message"],
             ])
+        writer.writerow([])
+        writer.writerow(["Audio Levels"])
+        writer.writerow(["Sampled", "Host", "RMS dBFS", "Peak dBFS", "Listeners", "Device", "Quality"])
+        for sample in report.get("audio_levels", []):
+            writer.writerow([
+                sample["sampled_at"],
+                sample["host_slug"] or "",
+                "" if sample["signal_level_db"] is None else f"{sample['signal_level_db']:.2f}",
+                "" if sample["signal_peak_db"] is None else f"{sample['signal_peak_db']:.2f}",
+                sample["listener_count"],
+                sample["current_device"],
+                sample["connection_quality_label"],
+            ])
         csv_payload = output.getvalue()
         response = Response(csv_payload, mimetype="text/csv")
         response.headers["Content-Disposition"] = f'attachment; filename="webcall-report-{meeting_id}.csv"'

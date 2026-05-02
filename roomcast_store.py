@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from host_defaults import get_default_hosts
@@ -245,6 +245,31 @@ class RoomCastStore:
 
                 CREATE INDEX IF NOT EXISTS idx_meeting_incidents_room_time
                 ON meeting_incidents(room_slug, occurred_at DESC);
+
+                CREATE TABLE IF NOT EXISTS audio_level_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room_slug TEXT NOT NULL,
+                    host_slug TEXT,
+                    sampled_at TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'watchdog',
+                    signal_level_db REAL,
+                    signal_peak_db REAL,
+                    signal_level_percent REAL,
+                    signal_peak_percent REAL,
+                    listener_count INTEGER NOT NULL DEFAULT 0,
+                    broadcasting INTEGER NOT NULL DEFAULT 0,
+                    is_ingesting INTEGER NOT NULL DEFAULT 0,
+                    desired_active INTEGER NOT NULL DEFAULT 0,
+                    current_device TEXT NOT NULL DEFAULT '',
+                    stream_transport TEXT NOT NULL DEFAULT '',
+                    connection_quality_percent REAL,
+                    connection_quality_label TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(room_slug) REFERENCES rooms(slug) ON DELETE CASCADE,
+                    FOREIGN KEY(host_slug) REFERENCES hosts(slug) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audio_level_samples_room_time
+                ON audio_level_samples(room_slug, sampled_at DESC);
 
                 CREATE TABLE IF NOT EXISTS room_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1290,6 +1315,122 @@ class RoomCastStore:
                 occurred_at=timestamp,
             )
 
+    def record_audio_level_sample(
+        self,
+        room_slug: str,
+        *,
+        host_slug: str | None = None,
+        source: str = "watchdog",
+        signal_level_db: float | None = None,
+        signal_peak_db: float | None = None,
+        signal_level_percent: float | None = None,
+        signal_peak_percent: float | None = None,
+        listener_count: int = 0,
+        broadcasting: bool = False,
+        is_ingesting: bool = False,
+        desired_active: bool = False,
+        current_device: str = "",
+        stream_transport: str = "",
+        connection_quality_percent: float | None = None,
+        connection_quality_label: str = "",
+        sampled_at: str | None = None,
+    ) -> int:
+        timestamp = sampled_at or _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO audio_level_samples (
+                    room_slug,
+                    host_slug,
+                    sampled_at,
+                    source,
+                    signal_level_db,
+                    signal_peak_db,
+                    signal_level_percent,
+                    signal_peak_percent,
+                    listener_count,
+                    broadcasting,
+                    is_ingesting,
+                    desired_active,
+                    current_device,
+                    stream_transport,
+                    connection_quality_percent,
+                    connection_quality_label
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    room_slug,
+                    host_slug,
+                    timestamp,
+                    (source or "watchdog").strip() or "watchdog",
+                    signal_level_db,
+                    signal_peak_db,
+                    signal_level_percent,
+                    signal_peak_percent,
+                    max(0, int(listener_count or 0)),
+                    1 if broadcasting else 0,
+                    1 if is_ingesting else 0,
+                    1 if desired_active else 0,
+                    (current_device or "").strip(),
+                    (stream_transport or "").strip(),
+                    connection_quality_percent,
+                    (connection_quality_label or "").strip(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def audio_level_summary(self, room_slug: str, *, window_seconds: int = 300):
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(1, int(window_seconds)))).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS sample_count,
+                       AVG(signal_level_db) AS avg_signal_level_db,
+                       MIN(signal_level_db) AS min_signal_level_db,
+                       MAX(signal_level_db) AS max_signal_level_db,
+                       AVG(signal_peak_db) AS avg_signal_peak_db,
+                       MAX(signal_peak_db) AS max_signal_peak_db
+                FROM audio_level_samples
+                WHERE room_slug = ?
+                  AND sampled_at >= ?
+                  AND signal_level_db IS NOT NULL
+                """,
+                (room_slug, cutoff),
+            ).fetchone()
+            latest = connection.execute(
+                """
+                SELECT sampled_at, host_slug, signal_level_db, signal_peak_db,
+                       listener_count, broadcasting, is_ingesting, desired_active,
+                       current_device, connection_quality_label
+                FROM audio_level_samples
+                WHERE room_slug = ?
+                ORDER BY sampled_at DESC
+                LIMIT 1
+                """,
+                (room_slug,),
+            ).fetchone()
+
+        summary = {
+            "sample_count": int((row or {})["sample_count"] or 0),
+            "avg_signal_level_db": (row or {})["avg_signal_level_db"],
+            "min_signal_level_db": (row or {})["min_signal_level_db"],
+            "max_signal_level_db": (row or {})["max_signal_level_db"],
+            "avg_signal_peak_db": (row or {})["avg_signal_peak_db"],
+            "max_signal_peak_db": (row or {})["max_signal_peak_db"],
+            "latest": dict(latest) if latest else None,
+        }
+        return summary
+
+    def prune_audio_level_samples(self, *, retain_days: int = 14):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(retain_days)))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM audio_level_samples WHERE sampled_at < ?",
+                (cutoff,),
+            )
+            return int(cursor.rowcount or 0)
+
     def sync_meeting_state(self, room_slug: str, *, active: bool, host_slug: str | None = None, trigger_mode: str = "system", actor: str = ""):
         timestamp = _utc_now()
         with self._connect() as connection:
@@ -1503,6 +1644,19 @@ class RoomCastStore:
                 """,
                 (row["room_slug"], row["started_at"], ended_at),
             ).fetchall()
+            audio_levels = connection.execute(
+                """
+                SELECT sampled_at, host_slug, signal_level_db, signal_peak_db,
+                       listener_count, broadcasting, is_ingesting, desired_active,
+                       current_device, connection_quality_label
+                FROM audio_level_samples
+                WHERE room_slug = ?
+                  AND sampled_at >= ?
+                  AND sampled_at <= ?
+                ORDER BY sampled_at
+                """,
+                (row["room_slug"], row["started_at"], ended_at),
+            ).fetchall()
 
             summary["listeners"] = [
                 {
@@ -1523,5 +1677,20 @@ class RoomCastStore:
                     "message": incident["message"],
                 }
                 for incident in incidents
+            ]
+            summary["audio_levels"] = [
+                {
+                    "sampled_at": sample["sampled_at"],
+                    "host_slug": sample["host_slug"],
+                    "signal_level_db": sample["signal_level_db"],
+                    "signal_peak_db": sample["signal_peak_db"],
+                    "listener_count": sample["listener_count"],
+                    "broadcasting": bool(sample["broadcasting"]),
+                    "is_ingesting": bool(sample["is_ingesting"]),
+                    "desired_active": bool(sample["desired_active"]),
+                    "current_device": sample["current_device"],
+                    "connection_quality_label": sample["connection_quality_label"],
+                }
+                for sample in audio_levels
             ]
             return summary
